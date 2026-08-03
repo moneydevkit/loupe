@@ -505,6 +505,23 @@ mod tests {
 		git(repo, &["rev-parse", "HEAD"])
 	}
 
+	/// Bare-clone `remote` into `dest`, mirroring how the repo cache
+	/// populates a bare mirror before jobs check out of it.
+	fn clone_bare(remote: &Path, dest: &Path) {
+		let url = format!("file://{}", remote.display());
+		let output = Command::new("git")
+			.args(["clone", "--bare", "--quiet"])
+			.arg(&url)
+			.arg(dest)
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"git clone --bare failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+
 	#[tokio::test]
 	async fn checkout_revision_uses_original_sha_not_latest_branch_tip() {
 		let remote_tmp = tempfile::tempdir().unwrap();
@@ -514,20 +531,7 @@ mod tests {
 
 		let bare_tmp = tempfile::tempdir().unwrap();
 		let bare = bare_tmp.path().join("cache.git");
-		let url = format!("file://{}", remote_tmp.path().display());
-		let output = Command::new("git")
-			.arg("clone")
-			.arg("--bare")
-			.arg("--quiet")
-			.arg(&url)
-			.arg(&bare)
-			.output()
-			.unwrap();
-		assert!(
-			output.status.success(),
-			"git clone failed: {}",
-			String::from_utf8_lossy(&output.stderr)
-		);
+		clone_bare(remote_tmp.path(), &bare);
 
 		let (latest_workdir, latest_sha) = checkout_latest(&bare, Some("main")).await.unwrap();
 		assert_eq!(latest_sha, second);
