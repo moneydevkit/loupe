@@ -391,6 +391,23 @@ enum CheckoutTarget {
 	Revision(String),
 }
 
+/// Cap on how many submodule paths we name in the warning below.
+const SUBMODULE_PATH_LIMIT: usize = 10;
+
+/// Collect the gitlink paths in `tree`. A checkout materializes these
+/// as empty directories, so scanners never see submodule contents.
+fn submodule_paths(tree: &git2::Tree<'_>) -> Result<Vec<String>> {
+	let mut paths = Vec::new();
+	tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+		if entry.filemode() == i32::from(git2::FileMode::Commit) {
+			paths.push(format!("{root}{}", String::from_utf8_lossy(entry.name_bytes())));
+		}
+		git2::TreeWalkResult::Ok
+	})
+	.context("inspecting repository submodules")?;
+	Ok(paths)
+}
+
 async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::TempDir, String)> {
 	let bare = bare.to_path_buf();
 	let tmp = tempfile::tempdir().context("creating temp worktree dir")?;
@@ -422,8 +439,28 @@ async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::Temp
 			},
 		};
 		let tree = commit.tree().context("resolving commit tree")?;
+		// Diagnostics only: never fail a checkout over the warning.
+		match submodule_paths(&tree) {
+			Ok(paths) if !paths.is_empty() => tracing::warn!(
+				bare_repo = %bare.display(),
+				head_sha = %commit.id(),
+				submodule_count = paths.len(),
+				submodules = ?&paths[..paths.len().min(SUBMODULE_PATH_LIMIT)],
+				"checkout leaves submodules unpopulated; their contents are not scanned",
+			),
+			Ok(_) => {},
+			Err(e) => tracing::debug!(error = ?e, "could not inspect submodules for warning"),
+		}
+		// `target_dir` alone leaves the handle bare, and libgit2 refuses
+		// to resolve a gitlink without a working tree. Point this handle
+		// at the temp dir; with `update_gitlink` false nothing is
+		// persisted, so the shared bare cache is untouched.
+		repo.set_workdir(&workdir, false).context("attaching temporary worktree to bare repo")?;
 		let mut opts = git2::build::CheckoutBuilder::new();
-		opts.target_dir(&workdir).recreate_missing(true).force();
+		// Never touch the index in the bare cache: it is shared by every
+		// job checking out of this mirror, and the checkout is
+		// content-only, so scanners read the files directly.
+		opts.target_dir(&workdir).recreate_missing(true).force().update_index(false);
 		repo.checkout_tree(tree.as_object(), Some(&mut opts))
 			.context("checking out tree into worktree dir")?;
 		Ok(commit.id().to_string())
@@ -505,6 +542,111 @@ mod tests {
 		git(repo, &["rev-parse", "HEAD"])
 	}
 
+	/// Commit a gitlink at `vendor/dependency` pointing at
+	/// `submodule_commit`, plus the matching `.gitmodules` entry. Uses
+	/// `update-index --cacheinfo` so no real submodule clone is needed.
+	fn commit_submodule_gitlink(repo: &Path, submodule_commit: &str) -> String {
+		std::fs::write(
+			repo.join(".gitmodules"),
+			"[submodule \"dependency\"]\n\tpath = vendor/dependency\n\turl = https://example.com/dependency.git\n",
+		)
+		.unwrap();
+		git(repo, &["add", ".gitmodules"]);
+		git(
+			repo,
+			&[
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				&format!("160000,{submodule_commit},vendor/dependency"),
+			],
+		);
+		git(repo, &["commit", "-q", "-m", "Add a submodule"]);
+		git(repo, &["rev-parse", "HEAD"])
+	}
+
+	/// Bare-clone `remote` into `dest`, mirroring how the repo cache
+	/// populates a bare mirror before jobs check out of it.
+	fn clone_bare(remote: &Path, dest: &Path) {
+		let url = format!("file://{}", remote.display());
+		let output = Command::new("git")
+			.args(["clone", "--bare", "--quiet"])
+			.arg(&url)
+			.arg(dest)
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"git clone --bare failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+
+	#[tokio::test]
+	async fn checkout_tolerates_submodule_gitlinks() {
+		let remote_tmp = tempfile::tempdir().unwrap();
+		init_git_repo(remote_tmp.path());
+		let submodule_commit = commit_file(remote_tmp.path(), "one\n", "One");
+		let head = commit_submodule_gitlink(remote_tmp.path(), &submodule_commit);
+
+		let bare_tmp = tempfile::tempdir().unwrap();
+		let bare = bare_tmp.path().join("cache.git");
+		clone_bare(remote_tmp.path(), &bare);
+
+		let bare_repo = git2::Repository::open_bare(&bare).unwrap();
+		let tree = bare_repo.head().unwrap().peel_to_tree().unwrap();
+		assert_eq!(submodule_paths(&tree).unwrap(), vec!["vendor/dependency".to_owned()]);
+
+		// Both checkout entry points must survive the gitlink, leaving
+		// the submodule as an empty directory rather than failing.
+		for (label, checked_out, workdir) in [
+			{
+				let (workdir, sha) = checkout_latest(&bare, Some("main"))
+					.await
+					.unwrap_or_else(|e| panic!("checkout_latest rejected the gitlink: {e:#}"));
+				("checkout_latest", sha, workdir)
+			},
+			{
+				let (workdir, sha) = checkout_revision(&bare, &head)
+					.await
+					.unwrap_or_else(|e| panic!("checkout_revision rejected the gitlink: {e:#}"));
+				("checkout_revision", sha, workdir)
+			},
+		] {
+			assert_eq!(checked_out, head, "{label} resolved the wrong commit");
+			let submodule = workdir.path().join("vendor/dependency");
+			assert!(submodule.is_dir(), "{label} did not create the submodule dir");
+			assert_eq!(
+				std::fs::read_dir(&submodule).unwrap().count(),
+				0,
+				"{label} populated the submodule",
+			);
+			assert!(
+				workdir.path().join(".gitmodules").is_file(),
+				"{label} did not check out .gitmodules",
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn checkout_does_not_write_an_index_into_the_bare_cache() {
+		let remote_tmp = tempfile::tempdir().unwrap();
+		init_git_repo(remote_tmp.path());
+		let head = commit_file(remote_tmp.path(), "one\n", "One");
+
+		let bare_tmp = tempfile::tempdir().unwrap();
+		let bare = bare_tmp.path().join("cache.git");
+		clone_bare(remote_tmp.path(), &bare);
+		assert!(!bare.join("index").exists(), "a fresh bare mirror has no index");
+
+		let (_workdir, sha) = checkout_latest(&bare, Some("main")).await.unwrap();
+		assert_eq!(sha, head);
+		assert!(
+			!bare.join("index").exists(),
+			"checkout must not write an index into the shared bare cache",
+		);
+	}
+
 	#[tokio::test]
 	async fn checkout_revision_uses_original_sha_not_latest_branch_tip() {
 		let remote_tmp = tempfile::tempdir().unwrap();
@@ -514,20 +656,7 @@ mod tests {
 
 		let bare_tmp = tempfile::tempdir().unwrap();
 		let bare = bare_tmp.path().join("cache.git");
-		let url = format!("file://{}", remote_tmp.path().display());
-		let output = Command::new("git")
-			.arg("clone")
-			.arg("--bare")
-			.arg("--quiet")
-			.arg(&url)
-			.arg(&bare)
-			.output()
-			.unwrap();
-		assert!(
-			output.status.success(),
-			"git clone failed: {}",
-			String::from_utf8_lossy(&output.stderr)
-		);
+		clone_bare(remote_tmp.path(), &bare);
 
 		let (latest_workdir, latest_sha) = checkout_latest(&bare, Some("main")).await.unwrap();
 		assert_eq!(latest_sha, second);
