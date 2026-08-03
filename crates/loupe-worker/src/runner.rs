@@ -423,7 +423,10 @@ async fn checkout(bare: &Path, target: CheckoutTarget) -> Result<(tempfile::Temp
 		};
 		let tree = commit.tree().context("resolving commit tree")?;
 		let mut opts = git2::build::CheckoutBuilder::new();
-		opts.target_dir(&workdir).recreate_missing(true).force();
+		// Never touch the index in the bare cache: it is shared by every
+		// job checking out of this mirror, and the checkout is
+		// content-only, so scanners read the files directly.
+		opts.target_dir(&workdir).recreate_missing(true).force().update_index(false);
 		repo.checkout_tree(tree.as_object(), Some(&mut opts))
 			.context("checking out tree into worktree dir")?;
 		Ok(commit.id().to_string())
@@ -519,6 +522,25 @@ mod tests {
 			output.status.success(),
 			"git clone --bare failed: {}",
 			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+
+	#[tokio::test]
+	async fn checkout_does_not_write_an_index_into_the_bare_cache() {
+		let remote_tmp = tempfile::tempdir().unwrap();
+		init_git_repo(remote_tmp.path());
+		let head = commit_file(remote_tmp.path(), "one\n", "One");
+
+		let bare_tmp = tempfile::tempdir().unwrap();
+		let bare = bare_tmp.path().join("cache.git");
+		clone_bare(remote_tmp.path(), &bare);
+		assert!(!bare.join("index").exists(), "a fresh bare mirror has no index");
+
+		let (_workdir, sha) = checkout_latest(&bare, Some("main")).await.unwrap();
+		assert_eq!(sha, head);
+		assert!(
+			!bare.join("index").exists(),
+			"checkout must not write an index into the shared bare cache",
 		);
 	}
 
