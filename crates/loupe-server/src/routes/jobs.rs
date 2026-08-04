@@ -72,6 +72,13 @@ fn job_to_info(row: &JobRow) -> JobInfo {
 pub struct ListQuery {
 	#[serde(default)]
 	pub limit: Option<i64>,
+	/// Comma-separated `JobState` values; a job matches if it is in any of
+	/// them. Accepts a list because "finished" spans three states, and an
+	/// operator view wants them in one query rather than three.
+	#[serde(default)]
+	pub state: Option<String>,
+	#[serde(default)]
+	pub kind: Option<String>,
 }
 
 fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String)> {
@@ -79,6 +86,43 @@ fn positive_limit(limit: Option<i64>) -> Result<Option<i64>, (StatusCode, String
 		return Err((StatusCode::BAD_REQUEST, "limit must be positive".into()));
 	}
 	Ok(limit)
+}
+
+/// Parse the `state=` filter. Rejects unknown values loudly rather than
+/// silently returning everything — a typo'd filter that looks like it
+/// worked is worse than an error.
+fn parse_states(raw: Option<&str>) -> Result<Vec<JobState>, (StatusCode, String)> {
+	let Some(raw) = raw else {
+		return Ok(Vec::new());
+	};
+	let mut states = Vec::new();
+	for token in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+		let state: JobState = token.parse().map_err(|_| {
+			(
+				StatusCode::BAD_REQUEST,
+				format!(
+					"unknown job state {token:?}; expected any of \
+					 queued, leased, succeeded, failed, cancelled"
+				),
+			)
+		})?;
+		if !states.contains(&state) {
+			states.push(state);
+		}
+	}
+	if states.is_empty() {
+		return Err((StatusCode::BAD_REQUEST, "state must name at least one job state".into()));
+	}
+	Ok(states)
+}
+
+fn parse_kind(raw: Option<&str>) -> Result<Option<JobKind>, (StatusCode, String)> {
+	raw.map(|k| {
+		k.parse::<JobKind>().map_err(|_| {
+			(StatusCode::BAD_REQUEST, format!("unknown job kind {k:?}; expected scan or verify"))
+		})
+	})
+	.transpose()
 }
 
 /// `POST /v1/repos/:id/scan` — admin enqueues a scan job for `id`.
@@ -117,14 +161,20 @@ pub async fn enqueue_scan(
 	Ok((StatusCode::CREATED, Json(ScanResponse { protocol_version: PROTOCOL_VERSION, job_id })))
 }
 
-/// `GET /v1/jobs` — admin lists jobs (most recent first).
+/// `GET /v1/jobs` — admin lists jobs (most recent first). `state` and
+/// `kind` narrow the result server-side so a caller watching one part of
+/// the queue doesn't have to pull the whole table and filter locally.
 pub async fn list(
 	State(state): State<AppState>, Query(qp): Query<ListQuery>,
 ) -> Result<Json<Vec<JobInfo>>, (StatusCode, String)> {
-	let limit = positive_limit(qp.limit)?;
+	let filter = jobs::JobFilter {
+		states: parse_states(qp.state.as_deref())?,
+		kind: parse_kind(qp.kind.as_deref())?,
+		limit: positive_limit(qp.limit)?,
+	};
 	let rows = state
 		.db
-		.with_conn(|c| Ok(jobs::list(c, limit)?))
+		.with_conn(|c| Ok(jobs::list(c, &filter)?))
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list jobs: {e}")))?;
 	Ok(Json(rows.iter().map(job_to_info).collect()))
 }
