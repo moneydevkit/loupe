@@ -966,6 +966,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "loupe-web"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "blake3",
+ "clap",
+ "loupe-proto",
+ "loupe-server",
+ "loupe-storage",
+ "loupe-tls",
+ "rand_core 0.6.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "loupe-worker"
 version = "0.0.0"
 dependencies = [

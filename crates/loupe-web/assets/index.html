@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>loupe</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>loupe</h1>
+  <nav id="tabs" aria-label="Sections">
+    <button type="button" data-view="repos" aria-current="true">Repos</button>
+    <button type="button" data-view="jobs">Jobs</button>
+    <button type="button" data-view="findings">Findings</button>
+  </nav>
+  <div id="status" class="status">
+    <span id="identity" title="Admin identity this dashboard authenticates as">…</span>
+    <span id="health" class="pill">checking…</span>
+  </div>
+</header>
+
+<p id="banner" class="banner" hidden></p>
+
+<main>
+  <!-- Repos -->
+  <section id="view-repos" class="view">
+    <div class="toolbar">
+      <h2>Repositories</h2>
+      <button type="button" id="repo-add-toggle">Add repository</button>
+      <button type="button" id="repos-refresh" class="secondary">Refresh</button>
+    </div>
+
+    <form id="repo-add" class="card" hidden autocomplete="off">
+      <h3>Add repository</h3>
+      <p class="hint">
+        The clone URL and reporting destination cannot be changed later —
+        re-register the repository instead. Pick them deliberately.
+      </p>
+      <label>Clone URL
+        <input name="clone_url" type="url" required
+               placeholder="https://github.com/acme/widget.git">
+      </label>
+      <label>Branch <span class="optional">optional</span>
+        <input name="branch" type="text" placeholder="main">
+      </label>
+      <label>Scan interval (seconds) <span class="optional">optional</span>
+        <input name="scan_interval_seconds" type="number" min="1" placeholder="86400">
+      </label>
+      <fieldset>
+        <legend>Reporting</legend>
+        <label class="inline"><input type="radio" name="reporting" value="github_issue" checked>
+          GitHub issues</label>
+        <label class="inline"><input type="radio" name="reporting" value="email"> Email</label>
+        <label class="inline"><input type="radio" name="reporting" value="manual">
+          Manual (no reporter)</label>
+
+        <div data-reporting="github_issue">
+          <label>Target owner
+            <input name="target_owner" type="text" placeholder="acme">
+          </label>
+          <label>Target repo
+            <input name="target_repo" type="text" placeholder="widget-security">
+          </label>
+          <label>GitHub PAT
+            <input name="github_pat" type="password" autocomplete="new-password">
+            <span class="hint">
+              Needs Issues: read and write on the tracker repo. Stored
+              encrypted server-side and never returned by the API.
+            </span>
+          </label>
+        </div>
+
+        <div data-reporting="email" hidden>
+          <label>To <span class="optional">comma-separated</span>
+            <input name="email_to" type="text" placeholder="security@acme.test">
+          </label>
+          <label>From <span class="optional">optional</span>
+            <input name="email_from" type="text">
+          </label>
+          <label>Subject prefix <span class="optional">optional</span>
+            <input name="email_subject_prefix" type="text" placeholder="[loupe]">
+          </label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Policy</legend>
+        <label class="inline"><input type="checkbox" name="verification_enabled">
+          Route findings through verifier jobs</label>
+        <label class="inline"><input type="checkbox" name="require_approval">
+          Hold confirmed findings for approval</label>
+        <p class="hint">
+          Leave both unchecked to inherit the server defaults.
+        </p>
+      </fieldset>
+      <div class="actions">
+        <button type="submit">Register</button>
+        <button type="button" data-cancel="repo-add" class="secondary">Cancel</button>
+      </div>
+    </form>
+
+    <div id="repos-list" class="rows" aria-live="polite"></div>
+  </section>
+
+  <!-- Jobs -->
+  <section id="view-jobs" class="view" hidden>
+    <div class="toolbar">
+      <h2>Jobs</h2>
+      <label class="inline">Kind
+        <select id="jobs-kind">
+          <option value="">any</option>
+          <option value="scan">scan</option>
+          <option value="verify">verify</option>
+        </select>
+      </label>
+      <label class="inline">Per column
+        <input id="jobs-limit" type="number" min="1" value="25">
+      </label>
+      <label class="inline"><input type="checkbox" id="jobs-auto" checked> Auto-refresh</label>
+      <button type="button" id="jobs-refresh" class="secondary">Refresh</button>
+    </div>
+    <div class="board">
+      <div class="column">
+        <h3>Queued <span class="count" id="count-queued">0</span></h3>
+        <div id="jobs-queued" class="rows" aria-live="polite"></div>
+      </div>
+      <div class="column">
+        <h3>Leased <span class="count" id="count-leased">0</span></h3>
+        <div id="jobs-leased" class="rows" aria-live="polite"></div>
+      </div>
+      <div class="column">
+        <h3>Finished <span class="count" id="count-finished">0</span></h3>
+        <div id="jobs-finished" class="rows" aria-live="polite"></div>
+      </div>
+    </div>
+    <p class="hint" id="jobs-scope"></p>
+  </section>
+
+  <!-- Findings -->
+  <section id="view-findings" class="view" hidden>
+    <div class="toolbar">
+      <h2>Findings</h2>
+      <label class="inline">Repository
+        <select id="findings-repo"></select>
+      </label>
+      <label class="inline">State
+        <select id="findings-state">
+          <option value="">any</option>
+          <option value="pending">pending</option>
+          <option value="validating">validating</option>
+          <option value="awaiting_approval">awaiting approval</option>
+          <option value="confirmed">confirmed</option>
+          <option value="dismissed">dismissed</option>
+          <option value="reported">reported</option>
+        </select>
+      </label>
+      <label class="inline">Severity
+        <select id="findings-severity">
+          <option value="">any</option>
+          <option value="critical">critical</option>
+          <option value="high">high</option>
+          <option value="medium">medium</option>
+          <option value="low">low</option>
+          <option value="info">info</option>
+        </select>
+      </label>
+      <label class="inline">Fetch
+        <input id="findings-limit" type="number" min="1" value="200">
+      </label>
+      <button type="button" id="findings-refresh" class="secondary">Refresh</button>
+    </div>
+
+    <form id="findings-search-form" class="search">
+      <label>Search
+        <input id="findings-search" type="search"
+               placeholder="keywords, e.g. deserialize buffer">
+      </label>
+      <button type="submit">Search</button>
+      <button type="button" id="findings-search-clear" class="secondary">Clear</button>
+      <p class="hint">
+        Full-text over title, description and file path — not diffs.
+        Every word must appear; there are no wildcards, so
+        <code>auth</code> will not match <code>authentication</code>.
+        Terms shorter than two characters are dropped. Results are ranked
+        by relevance, not recency.
+      </p>
+    </form>
+
+    <p class="hint" id="findings-scope"></p>
+    <div id="findings-list" class="rows" aria-live="polite"></div>
+    <div id="finding-detail" class="card" hidden></div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
