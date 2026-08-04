@@ -406,7 +406,8 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		"UPDATE jobs
 		   SET state = ?2,
 		       worker_id = NULL,
-		       lease_expires_at = NULL
+		       lease_expires_at = NULL,
+		       started_at = NULL
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
 		   AND attempts < ?3",
@@ -910,6 +911,54 @@ mod tests {
 		let row = db.with_conn(|c| Ok(list(c, None)?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Queued);
 		assert_eq!(row.attempts, 1, "reap doesn't reset attempts");
+	}
+
+	#[test]
+	fn reap_requeue_resets_attempt_timing() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let job_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					0,
+				)?)
+			})
+			.unwrap();
+
+		let first = db
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 10)?))
+			.unwrap()
+			.expect("first attempt leases");
+		assert_eq!(first.started_at, Some(100));
+
+		db.with_conn(|c| Ok(reap_stale_leases(c, 200)?)).unwrap();
+		let queued = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
+		assert_eq!(
+			queued.started_at, None,
+			"requeue must discard the expired attempt's start time"
+		);
+
+		let second = db
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 300, 10)?))
+			.unwrap()
+			.expect("second attempt leases");
+		assert_eq!(second.started_at, Some(300), "the new attempt gets its own start time");
+		db.with_conn(|c| {
+			Ok(complete(c, job_id, worker_id, JobState::Succeeded, Some("sha"), None, 305)?)
+		})
+		.unwrap();
+
+		let finished = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
+		assert_eq!(finished.started_at, Some(300));
+		assert_eq!(finished.finished_at, Some(305));
 	}
 
 	#[test]

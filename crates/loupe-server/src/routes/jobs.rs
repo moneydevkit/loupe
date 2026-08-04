@@ -60,6 +60,11 @@ fn job_to_info(row: &JobRow) -> JobInfo {
 		target_finding_id: row.target_finding_id,
 		attempts: row.attempts,
 		enqueued_at: row.enqueued_at,
+		worker_id: row.worker_id,
+		lease_expires_at: row.lease_expires_at,
+		started_at: row.started_at,
+		finished_at: row.finished_at,
+		error: row.error.clone(),
 	}
 }
 

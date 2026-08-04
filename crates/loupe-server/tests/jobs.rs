@@ -412,6 +412,85 @@ async fn end_to_end_scan_lifecycle() {
 	f.handle.shutdown().await;
 }
 
+/// A job listing has to answer "how long did this take, who ran it, and
+/// why did it fail" without a second round-trip, so the lease/timing/error
+/// block must be populated at each stage rather than only in the DB.
+#[tokio::test]
+async fn job_info_reports_lease_timing_and_failure_detail() {
+	let f = bring_up_with_repo_and_worker().await;
+
+	let get_job = |job_id: i64| {
+		let admin = f.admin.clone();
+		async move {
+			admin
+				.get(format!("https://loupe-server/v1/jobs/{job_id}"))
+				.send()
+				.await
+				.unwrap()
+				.json::<JobInfo>()
+				.await
+				.unwrap()
+		}
+	};
+
+	// Queued: nothing has run yet, so the whole block is absent.
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let queued = get_job(scan.job_id).await;
+	assert_eq!(queued.state, JobState::Queued);
+	assert_eq!(queued.worker_id, None, "a queued job has no worker");
+	assert_eq!(queued.lease_expires_at, None);
+	assert_eq!(queued.started_at, None);
+	assert_eq!(queued.finished_at, None);
+	assert_eq!(queued.error, None);
+
+	// Leased: worker and lease deadline become visible.
+	let env = lease_job(&f.worker).await;
+	let leased = get_job(env.job_id).await;
+	assert_eq!(leased.state, JobState::Leased);
+	assert!(leased.worker_id.is_some(), "a leased job names its worker");
+	let lease_expires_at = leased.lease_expires_at.expect("leased job has a lease deadline");
+	let started_at = leased.started_at.expect("leased job has a start time");
+	assert!(
+		lease_expires_at > started_at,
+		"lease deadline {lease_expires_at} must be after start {started_at}"
+	);
+	assert_eq!(leased.finished_at, None, "a leased job has not finished");
+
+	// Failed: the worker's reason reaches the listing verbatim.
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: None,
+			error: Some("clone failed: host unreachable".into()),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let failed = get_job(env.job_id).await;
+	assert_eq!(failed.state, JobState::Failed);
+	assert_eq!(failed.error.as_deref(), Some("clone failed: host unreachable"));
+	let finished_at = failed.finished_at.expect("a terminal job has a finish time");
+	assert!(
+		finished_at >= failed.started_at.expect("still has its start time"),
+		"finish {finished_at} must not precede start"
+	);
+	assert_eq!(failed.attempts, 1, "one lease means one attempt");
+
+	// The same detail shows up in the list view, not just the by-id route.
+	let listed: Vec<JobInfo> =
+		f.admin.get("https://loupe-server/v1/jobs").send().await.unwrap().json().await.unwrap();
+	let listed = listed.iter().find(|j| j.job_id == env.job_id).expect("job is listed");
+	assert_eq!(listed.error.as_deref(), Some("clone failed: host unreachable"));
+	assert_eq!(listed.finished_at, Some(finished_at));
+
+	f.handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn failed_scan_discards_pending_findings_so_retry_can_insert_them() {
 	let f = bring_up_with_repo_and_worker().await;
