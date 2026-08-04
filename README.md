@@ -393,6 +393,20 @@ loupectl finding show <finding-id> --json   # raw FindingDetail DTO
 loupectl finding search <repo-id> "<keywords>"  # FTS5 keyword search
 ```
 
+`GET /v1/jobs` also accepts `state` and `kind` filters, which is what the
+dashboard's job board uses. `state` takes a comma-separated set, so the
+whole "finished" group is one request:
+
+```
+GET /v1/jobs?state=queued
+GET /v1/jobs?state=succeeded,failed,cancelled&kind=scan&limit=25
+```
+
+Unknown values are rejected with a 400 naming the accepted set rather
+than being ignored — a filter that looks like it worked but didn't is
+worse than an error. There is no pagination anywhere yet; `limit` is the
+only knob, and it is deliberately uncapped so older rows stay reachable.
+
 `finding search` is also reachable from inside the LLM scanner — the
 MCP tool `query_prior_findings` calls the same endpoint, so the
 agent can ask "have we seen anything like this before?" mid-scan.
@@ -442,6 +456,91 @@ loupectl repo update <id> --inherit-approval         # fall back to the server d
 The clone URL and reporting destination are deliberately *not*
 patchable: silently re-pointing where new findings get filed is too
 easy a footgun. Re-register the repo if you need to change either.
+
+### 9. Or drive it from a browser
+
+`loupe-web` serves the same admin operations as a dashboard. It is an
+ordinary admin client — same certificate, same `/v1` routes, no database
+access — so it needs exactly the environment `loupectl` already needs:
+
+```
+export LOUPE_SERVER_URL=https://127.0.0.1:8443
+export LOUPE_CA_CERT=/var/lib/loupe/ca.pem
+export LOUPE_ADMIN_CERT=/var/lib/loupe/admin.pem
+export LOUPE_ADMIN_KEY=/var/lib/loupe/admin.key
+
+loupe-web                       # binds 127.0.0.1:8455 by default
+```
+
+It prints a URL with a one-off token in the fragment. The page moves the
+token into session storage scoped to that exact scheme, host, and port,
+removes the fragment from the address bar, and sends the token in an
+`X-Loupe-Capability` header on API requests:
+
+```
+loupe-web listening on http://127.0.0.1:8455
+
+    http://127.0.0.1:8455/#t=<43-char token>
+```
+
+Session storage is scoped by origin and top-level browsing context, so
+reloading the authorized tab keeps working. A new independent tab or
+window starts without the token and its first API call answers `401`;
+reopen the startup URL there to authorize it. An auxiliary context opened
+from an authorized page can initially inherit a copy of its session
+storage, after which the two stores are independent. The token itself does
+not change while the process runs.
+
+Covers repo list/add/update/delete, PAT rotation, switching a repo to
+GitHub reporting, ad-hoc scans (full and incremental), the job board, and
+finding review including the proof-of-concept diff and approve/reject.
+Worker registration is **not** exposed: there is no list-workers RPC to
+drive a revoke UI from, and `worker register` returns a private key the
+server keeps no copy of, which has no business travelling through a
+browser. Keep using `loupectl worker` for that.
+
+#### What it does and does not assume
+
+`loupe-web` **refuses to bind anything but loopback.** It holds the admin
+certificate and its own listener has no transport authentication, so a
+routable bind would hand loupe admin rights to anyone who can reach the
+port. On loopback the trust boundary is the one you already have: whoever
+can run `loupectl` on that machine can drive this. That is also why the
+browser needs no client certificate — there is nothing to import.
+
+Two consequences of loopback HTTP are handled rather than assumed:
+
+- **Any local process can connect**, including one that cannot read
+  `admin.key`. Hence the token, printed once to your terminal so another
+  user on a shared host cannot obtain it. Treat it like the admin key.
+  The token is not stored in a cookie because cookies are shared across
+  every port on a host; session storage and the capability header keep it
+  scoped to the dashboard's origin. The cost of that choice is that the
+  token is readable by script on the page, where an `HttpOnly` cookie
+  would not have been. The CSP below is therefore load-bearing: it blocks
+  injected inline script and restricts fetch and resource destinations.
+  It is not complete containment after arbitrary script execution; for
+  example, it does not block every top-level navigation. An injected
+  same-origin script could drive the API with an `HttpOnly` cookie anyway,
+  while a cookie leaks the token to every other local port
+  unconditionally, so origin isolation is the better trade here.
+- **Any page you visit can issue requests to `127.0.0.1`.** The browser
+  blocks reading the response, but a state-changing request would still
+  execute. Mutating requests must therefore be same-origin *and* carry an
+  `X-Loupe-Dashboard` header a cross-origin caller cannot set without a
+  preflight, and every request must be addressed to the dashboard's own
+  `Host` so a rebound DNS name cannot pose as same-origin.
+
+Finding titles, descriptions and diffs come from scanned repositories and
+model output, so they are untrusted. Nothing is interpolated server-side:
+the page renders them as text under a CSP that forbids inline script.
+
+Polling is limited to the visible view and pauses when the tab is hidden.
+Each timer is armed only after the prior refresh finishes, and manual or
+automatic refreshes are coalesced so only one three-request job refresh
+can run at a time. Every request lands on the server's single database
+connection and also stamps `workers.last_seen_at`, so an idle dashboard
+left open would otherwise compete with worker lease traffic.
 
 ## Human-in-the-loop approval
 
@@ -551,6 +650,8 @@ crates/
                   scanner trait + LLM backend + versioned MCP tool surface +
                   bwrap sandbox
   loupe-cli       loupectl admin CLI
+  loupe-web       loupe-web local operator dashboard (loopback HTTP,
+                  proxies the same admin RPCs as loupectl)
 ```
 
 See each crate's module-level docs for the design intent, and

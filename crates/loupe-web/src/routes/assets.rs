@@ -148,6 +148,24 @@ mod tests {
 		assert!(!APP_JS.contains("eval("));
 	}
 
+	/// The page pre-checks a search term so it can say "no usable terms"
+	/// instead of the misleading "no matches" the server's empty result
+	/// would imply. That only works while it strips the same characters as
+	/// `loupe_storage::findings::sanitize_fts_query`, which drops tokens
+	/// under two characters and removes `" * : ( ) '`. Pin the character
+	/// class so a change on either side is noticed here.
+	#[test]
+	fn the_search_prefilter_matches_the_server_sanitizer() {
+		assert!(
+			APP_JS.contains(r#"replace(/["*:()']/g, "")"#),
+			"app.js must strip exactly the characters sanitize_fts_query does"
+		);
+		assert!(
+			APP_JS.contains("token.length >= 2"),
+			"app.js must drop tokens shorter than 2 characters, as the server does"
+		);
+	}
+
 	#[test]
 	fn csp_denies_by_default_and_allows_no_inline() {
 		assert!(CSP.starts_with("default-src 'none'"));
