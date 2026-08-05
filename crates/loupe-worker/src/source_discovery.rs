@@ -5,6 +5,7 @@
 //! expensive per-source-file LLM fan-out, where we prefer production code
 //! and common project layouts over exhaustive repository traversal.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -179,6 +180,29 @@ pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<Path
 	out.sort();
 	out.dedup();
 	out
+}
+
+/// Narrow a walked file set to those changed since the base commit.
+///
+/// `files` are absolute, workdir-joined paths from [`walk_source_files`];
+/// `changed` holds the repo-relative paths git reports for the commit
+/// range. Keeping the intersection preserves all of the walk's project-root
+/// and exclusion logic and simply drops files that did not change. A walked
+/// file outside `changed` is skipped; a changed file the walk never selected
+/// (a test file, a non-source extension) stays skipped.
+pub(crate) fn retain_changed_files(
+	files: Vec<PathBuf>, workdir: &Path, changed: &HashSet<String>,
+) -> Vec<PathBuf> {
+	files
+		.into_iter()
+		.filter(|path| {
+			path.strip_prefix(workdir)
+				.ok()
+				.and_then(|rel| rel.to_str())
+				.map(|rel| changed.contains(rel))
+				.unwrap_or(false)
+		})
+		.collect()
 }
 
 #[derive(Default)]
@@ -778,6 +802,32 @@ mod tests {
 		assert!(names.iter().any(|n| n.ends_with("src/util.rs")), "names: {names:?}");
 		assert!(names.iter().all(|n| !n.contains("README")), "names: {names:?}");
 		assert!(names.iter().all(|n| !n.contains("tests/")), "names: {names:?}");
+	}
+
+	#[test]
+	fn retain_changed_files_keeps_only_intersecting_repo_relative_paths() {
+		let workdir = Path::new("/work");
+		let walked = vec![
+			PathBuf::from("/work/src/lib.rs"),
+			PathBuf::from("/work/src/util.rs"),
+			PathBuf::from("/work/src/net.rs"),
+		];
+		let changed: HashSet<String> =
+			["src/util.rs", "src/gone.rs", "README.md"].into_iter().map(String::from).collect();
+
+		let kept = retain_changed_files(walked, workdir, &changed);
+
+		// Only the walked file that also changed survives. A changed path the
+		// walk never selected (README.md) and a changed path not walked
+		// (src/gone.rs) both drop out.
+		assert_eq!(kept, vec![PathBuf::from("/work/src/util.rs")]);
+	}
+
+	#[test]
+	fn retain_changed_files_empty_change_set_selects_nothing() {
+		let workdir = Path::new("/work");
+		let walked = vec![PathBuf::from("/work/src/lib.rs")];
+		assert!(retain_changed_files(walked, workdir, &HashSet::new()).is_empty());
 	}
 
 	#[test]

@@ -16,10 +16,11 @@
 //! asked to produce a regression-test PoC inline). A second worker-
 //! side parse would be a poor model of what the agent already did.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use loupe_core::Finding;
 use tokio::sync::Semaphore;
@@ -28,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 use crate::llm::prompts::{self, DISCOVERY};
 use crate::llm::{LlmBackend, LlmRequest};
 use crate::scanner::{ScanContext, Scanner};
-use crate::source_discovery::{walk_source_files, ScannerConfig, ScannerConfigPatch};
+use crate::source_discovery::{
+	retain_changed_files, walk_source_files, ScannerConfig, ScannerConfigPatch,
+};
 
 pub const SCANNER_ID: &str = "llm-code-review";
 const CAPABILITIES: &[&str] = &["scan:llm"];
@@ -88,7 +91,38 @@ impl Scanner for LlmCodeReviewScanner {
 			}
 		}
 
-		let files = walk_source_files(&ctx.workdir, &cfg);
+		let mut files = walk_source_files(&ctx.workdir, &cfg);
+
+		// Incremental scan: when the lease carries a base SHA (repo
+		// registered for incremental scanning), analyse only files changed
+		// since it instead of re-running the whole repo through the LLM.
+		// This can miss a bug in an unchanged file exposed by a change
+		// elsewhere; that is the deliberate cost tradeoff. A git failure
+		// (unknown or unrelated base) falls back to a full scan rather than
+		// silently skipping files.
+		if let Some(base) = ctx.base_sha.as_deref() {
+			match changed_paths_between(&ctx.workdir, base, &ctx.head_sha).await {
+				Ok(changed) => {
+					let candidates = files.len();
+					files = retain_changed_files(files, &ctx.workdir, &changed);
+					tracing::info!(
+						base_sha = base,
+						head_sha = %ctx.head_sha,
+						candidates,
+						changed = files.len(),
+						"llm-code-review: incremental scan limited to changed files"
+					);
+				},
+				Err(e) => {
+					tracing::warn!(
+						base_sha = base,
+						error = %e,
+						"llm-code-review: incremental diff failed; scanning all files"
+					);
+				},
+			}
+		}
+
 		if files.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -181,6 +215,34 @@ impl LlmCodeReviewScanner {
 		}
 		errors
 	}
+}
+
+/// Repo-relative paths added, copied, modified, or renamed between two
+/// commits. Deletions are excluded: the file no longer exists, so there is
+/// nothing to scan, and a rename surfaces as its new path. `-z` gives
+/// NUL-delimited output so paths with spaces or unusual bytes need no
+/// unquoting. `git` runs on the worker, outside the scanner sandbox.
+async fn changed_paths_between(workdir: &Path, base: &str, head: &str) -> Result<HashSet<String>> {
+	let out = tokio::process::Command::new("git")
+		.arg("-C")
+		.arg(workdir)
+		.args(["diff", "--name-only", "-z", "--diff-filter=ACMR"])
+		.args([base, head])
+		.output()
+		.await
+		.context("spawning git diff for incremental scan")?;
+	if !out.status.success() {
+		anyhow::bail!(
+			"git diff {base}..{head} failed: {}",
+			String::from_utf8_lossy(&out.stderr).trim()
+		);
+	}
+	Ok(out
+		.stdout
+		.split(|byte| *byte == 0)
+		.filter(|segment| !segment.is_empty())
+		.map(|segment| String::from_utf8_lossy(segment).into_owned())
+		.collect())
 }
 
 /// Run one agent session against `file`. Returns `Err(())` for
@@ -331,5 +393,86 @@ mod tests {
 			1,
 			"ctx.config override should have caught widget.c"
 		);
+	}
+
+	fn git(dir: &Path, args: &[&str]) {
+		let out = std::process::Command::new("git")
+			.arg("-C")
+			.arg(dir)
+			.args(["-c", "user.email=t@t", "-c", "user.name=t"])
+			.args(args)
+			.output()
+			.unwrap();
+		assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+	}
+
+	fn commit_all(dir: &Path, msg: &str) -> String {
+		git(dir, &["add", "-A"]);
+		git(dir, &["commit", "-q", "-m", msg]);
+		let out = std::process::Command::new("git")
+			.arg("-C")
+			.arg(dir)
+			.args(["rev-parse", "HEAD"])
+			.output()
+			.unwrap();
+		String::from_utf8_lossy(&out.stdout).trim().to_owned()
+	}
+
+	#[tokio::test]
+	async fn incremental_scan_visits_only_files_changed_since_base() {
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// a\n"), ("src/util.rs", "// b\n")]);
+		git(tmp.path(), &["init", "-q", "-b", "main"]);
+		let base = commit_all(tmp.path(), "base");
+		std::fs::write(tmp.path().join("src/util.rs"), "// b changed\n").unwrap();
+		let head = commit_all(tmp.path(), "change util");
+
+		let scanned = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+		let scanned_for_stub = scanned.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+			// The discovery prompt embeds the repo-relative file path.
+			for candidate in ["src/lib.rs", "src/util.rs"] {
+				if req.prompt.contains(candidate) {
+					scanned_for_stub.lock().unwrap().push(candidate.to_owned());
+				}
+			}
+			Ok(String::new())
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+
+		let mut ctx = make_ctx(tmp.path());
+		ctx.base_sha = Some(base);
+		ctx.head_sha = head;
+		scanner.scan(&ctx).await.unwrap();
+
+		assert_eq!(
+			*scanned.lock().unwrap(),
+			vec!["src/util.rs".to_owned()],
+			"only the file changed since base should be scanned"
+		);
+	}
+
+	#[tokio::test]
+	async fn incremental_scan_with_no_changes_scans_nothing() {
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// a\n")]);
+		git(tmp.path(), &["init", "-q", "-b", "main"]);
+		let sha = commit_all(tmp.path(), "only commit");
+
+		let calls = Arc::new(AtomicUsize::new(0));
+		let calls_for_stub = calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+			calls_for_stub.fetch_add(1, Ordering::SeqCst);
+			Ok(String::new())
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+
+		let mut ctx = make_ctx(tmp.path());
+		ctx.base_sha = Some(sha.clone());
+		ctx.head_sha = sha;
+		let findings = scanner.scan(&ctx).await.unwrap();
+
+		assert!(findings.is_empty());
+		assert_eq!(calls.load(Ordering::SeqCst), 0, "base == head means no files to scan");
 	}
 }
