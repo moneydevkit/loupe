@@ -62,15 +62,22 @@
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-      in
-      {
-        packages.default = craneLib.buildPackage (
+        loupe = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
             doCheck = false; # Tests run in checks.test
+            meta.mainProgram = "loupe-server";
           }
         );
+      in
+      {
+        # One derivation carries all three binaries (loupe-server,
+        # loupe-worker, loupectl); `loupe` is just a named alias for it.
+        packages = {
+          default = loupe;
+          inherit loupe;
+        };
 
         checks = {
           clippy = craneLib.cargoClippy (
@@ -123,5 +130,21 @@
           '';
         };
       }
-    );
+    )
+    // {
+      # NixOS modules are not per-system, so they live outside
+      # eachDefaultSystem. ./nix/loupe.nix is a plain module with no flake
+      # dependency; this wrapper only defaults the package to our build.
+      nixosModules.loupe =
+        {
+          pkgs,
+          lib,
+          ...
+        }:
+        {
+          imports = [ ./nix/loupe.nix ];
+          services.loupe.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.loupe;
+        };
+      nixosModules.default = self.nixosModules.loupe;
+    };
 }
