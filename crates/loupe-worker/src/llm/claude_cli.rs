@@ -18,7 +18,6 @@
 //! cert are bind-mounted in at fixed paths the MCP child can refer
 //! to.
 
-use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,9 +25,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
-use super::mcp::{
-	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
-};
+use super::mcp::{bind_mcp_into_sandbox, prepare_mcp_scratch, sandbox_workdir, McpContext};
 use super::{summarize_cli_stream_for_error, CliModelConfig, LlmBackend, LlmRequest, LlmResponse};
 use crate::sandbox::SandboxBuilder;
 
@@ -43,73 +40,6 @@ const MAX_CLI_DIAGNOSTIC_CHARS: usize = 2_000;
 /// onto this path; dropping the scratch dir unlinks the source
 /// (sandbox view becomes EROFS, which the next call recreates).
 const SANDBOX_MCP_CONFIG: &str = "/loupe/mcp-config.json";
-
-/// Per-call MCP scratch: a host-side tempdir holding the JSON
-/// config that `claude --mcp-config` reads. The `TempDir` is
-/// returned so the caller keeps it alive until after claude exits;
-/// dropping the `TempDir` unlinks the config file.
-struct McpScratch {
-	#[allow(dead_code)] // RAII — drop at end of caller's scope cleans up.
-	dir: tempfile::TempDir,
-	config_path: PathBuf,
-}
-
-fn prepare_mcp_scratch(
-	ctx: &McpContext, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
-	sandbox_workdir: &str,
-) -> Result<McpScratch> {
-	let dir = tempfile::Builder::new()
-		.prefix("loupe-mcp-")
-		.tempdir()
-		.context("creating MCP scratch tempdir")?;
-	let config_path = dir.path().join("mcp-config.json");
-	let args = mcp_serve_args(ctx, repo_id, job_id, finding_id, sandbox_workdir);
-	let mut servers = serde_json::Map::new();
-	servers.insert(
-		"loupe".to_string(),
-		serde_json::json!({
-			"type": "stdio",
-			// Inside the sandbox the worker binary is mounted at
-			// SANDBOX_LOUPE_BIN, the cert files under /loupe/...
-			// — see the bind_ro calls above.
-			"command": SANDBOX_LOUPE_BIN,
-			"args": args,
-			// The MCP child inherits the bwrap'd env, which has
-			// HOME=/home/scanner + the forwarded ANTHROPIC_API_KEY
-			// (irrelevant for the MCP child but harmless). No
-			// extra env needed at this layer.
-			"env": {}
-		}),
-	);
-	// Conditionally attach bkb-mcp. The binary is bind-mounted under
-	// /loupe/bkb-mcp by the caller (see `run` below). bkb-mcp itself
-	// is a thin client to the BKB HTTP API: we always override its
-	// compiled-in localhost default to the worker-configured API URL
-	// by setting `BKB_API_URL` in the per-MCP
-	// `env` block — that's MCP-server-scoped, doesn't leak into
-	// claude or other potential sibling MCP children.
-	if ctx.bkb_mcp_path.is_some() {
-		servers.insert(
-			"bkb".to_string(),
-			serde_json::json!({
-				"type": "stdio",
-				"command": SANDBOX_BKB_MCP_BIN,
-				"args": [],
-				"env": { "BKB_API_URL": ctx.bkb_api_url.as_str() }
-			}),
-		);
-	}
-	let config = serde_json::json!({ "mcpServers": servers });
-	std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
-		.with_context(|| format!("writing MCP config at {}", config_path.display()))?;
-	tracing::debug!(
-		config_path = %config_path.display(),
-		repo_id,
-		job_id = ?job_id,
-		"loupe-mcp: prepared per-call scratch config",
-	);
-	Ok(McpScratch { dir, config_path })
-}
 
 pub struct ClaudeCliBackend {
 	bin: String,
@@ -228,19 +158,9 @@ impl LlmBackend for ClaudeCliBackend {
 		// early would unlink the config file out from under claude.
 		let _mcp_scratch = match (&self.mcp, req.repo_id) {
 			(Some(ctx), Some(repo_id)) => {
-				// Inside bwrap the worktree is at `/workdir`; in dev-
-				// only `LOUPE_DISABLE_SANDBOX` mode the MCP child has
-				// the same filesystem view as the worker, so the host
-				// path works directly.
-				let sandbox_workdir = if std::env::var_os(crate::sandbox::DISABLE_SANDBOX_ENV)
-					.is_some_and(|v| !v.is_empty())
-				{
-					req.workdir.to_string_lossy().into_owned()
-				} else {
-					"/workdir".to_owned()
-				};
+				let workdir = sandbox_workdir(&req.workdir);
 				let scratch =
-					prepare_mcp_scratch(ctx, repo_id, req.job_id, req.finding_id, &sandbox_workdir)
+					prepare_mcp_scratch(ctx, repo_id, req.job_id, req.finding_id, &workdir)
 						.context("preparing MCP scratch directory")?;
 				sandbox = bind_mcp_into_sandbox(sandbox, ctx)
 					.bind_ro(scratch.config_path.clone(), SANDBOX_MCP_CONFIG);

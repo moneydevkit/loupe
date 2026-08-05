@@ -29,7 +29,8 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use super::mcp::{
-	bind_mcp_into_sandbox, mcp_serve_args, McpContext, SANDBOX_BKB_MCP_BIN, SANDBOX_LOUPE_BIN,
+	bind_mcp_into_sandbox, mcp_serve_args, sandbox_workdir, McpContext, SANDBOX_BKB_MCP_BIN,
+	SANDBOX_LOUPE_BIN,
 };
 use super::{
 	codex_api_key_env, codex_home_dir, summarize_cli_stream_for_error, CliModelConfig, LlmBackend,
@@ -203,16 +204,9 @@ impl LlmBackend for CodexCliBackend {
 		// operator's `~/.codex/config.toml`.
 		let mcp_overrides: Vec<String> = match (&self.mcp, req.repo_id) {
 			(Some(ctx), Some(repo_id)) => {
-				let sandbox_workdir = if std::env::var_os(crate::sandbox::DISABLE_SANDBOX_ENV)
-					.is_some_and(|v| !v.is_empty())
-				{
-					req.workdir.to_string_lossy().into_owned()
-				} else {
-					"/workdir".to_owned()
-				};
+				let workdir = sandbox_workdir(&req.workdir);
 				sandbox = bind_mcp_into_sandbox(sandbox, ctx);
-				let args =
-					mcp_serve_args(ctx, repo_id, req.job_id, req.finding_id, &sandbox_workdir);
+				let args = mcp_serve_args(ctx, repo_id, req.job_id, req.finding_id, &workdir);
 				let mut overrides = Vec::new();
 				overrides.push(format!(
 					"mcp_servers.loupe.command={}",
