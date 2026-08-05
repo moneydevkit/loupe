@@ -169,18 +169,15 @@ struct Session {
 	verify: Option<VerifySessionState>,
 }
 
-/// Verify-mode buffer. The agent calls `submit_verdict` first
+/// Verify-mode state. The agent calls `submit_verdict` first
 /// (mandatory, locks for the rest of the session), then optionally
-/// `submit_patch` (only valid after a Confirmed verdict). Both
-/// tools just write to this buffer — nothing reaches the server
-/// until session end, when [`flush_verify_session`] POSTs one
-/// `VerdictSubmission` carrying the verdict (with the patch
-/// embedded on Confirmed).
+/// `submit_patch` (only valid after a Confirmed verdict).
 ///
-/// This buffer-and-flush pattern is what enforces the "verdict
-/// first, patch maybe" ordering at the protocol level: the agent
-/// can't see a "patch_unified row already populated" outcome and
-/// then revise its verdict, because nothing has hit the server yet.
+/// The verdict is POSTed from the request loop as soon as it is locked,
+/// so "verdict first, patch maybe" is enforced by this lock alone
+/// rather than by withholding writes from the server: a second
+/// `submit_verdict` is rejected here, and `submit_patch` consults the
+/// locked verdict before buffering.
 struct VerifySessionState {
 	finding_id: i64,
 	inner: tokio::sync::Mutex<VerifySessionInner>,
@@ -191,10 +188,16 @@ struct VerifySessionInner {
 	/// Locked on first `submit_verdict`. A second call returns an
 	/// error so the agent can't revise mid-session.
 	verdict: Option<loupe_core::Verdict>,
-	/// Locked on first `submit_patch`. Held separately from the
-	/// verdict's own `patch` field so we can pin "patch tool was
-	/// called once" even if the merge into Verdict::Confirmed
-	/// happens later, at flush time.
+	/// Set once the locked verdict has been POSTed to the server. The
+	/// request loop posts mid-session rather than at session end: the
+	/// agent CLI is the sandbox's main process, so when it exits bwrap's
+	/// PID-1 init exits with it and the kernel SIGKILLs the rest of the
+	/// namespace, this child included. A session-end flush loses the
+	/// verdict.
+	verdict_posted: bool,
+	/// Locked on first `submit_patch`. Buffered but not yet delivered:
+	/// the patch used to ride the verdict's session-end POST, which no
+	/// longer exists. Server-side delivery is a follow-up.
 	patch: Option<loupe_core::VerdictPatch>,
 }
 
@@ -257,12 +260,12 @@ struct RpcError {
 /// agent's file references resolve against (`/workdir` inside
 /// bwrap, the host worktree path in disable-sandbox mode).
 ///
-/// In verify mode, the verdict (and the optional patch) is buffered
-/// during the session and flushed in a single `POST /v1/jobs/:id/
-/// verdict` after stdin closes. If the agent never called
-/// `submit_verdict`, the function returns an error so the runner
-/// posts `complete(failed)` and the validating-deadline reaper
-/// later marks the verdict inconclusive.
+/// In verify mode the verdict is POSTed to `/v1/jobs/:id/verdict` from
+/// the request loop as soon as `submit_verdict` locks it, before the
+/// tool response is written. Reaching stdin EOF having never locked a
+/// verdict, or with one still undelivered after a final attempt, is an
+/// error so the runner posts `complete(failed)` and the
+/// validating-deadline reaper later marks the verdict inconclusive.
 pub async fn run_stdio_server(
 	client: Arc<ServerClient>, repo_id: i64, job_id: Option<i64>, finding_id: Option<i64>,
 	workdir: PathBuf,
@@ -305,11 +308,41 @@ pub async fn run_stdio_server(
 		let Some(id) = request.id.clone() else { continue };
 
 		let response = handle_request(&session, &request, id).await;
+
+		// POST the verdict *before* answering the tool call. The agent is
+		// still blocked reading this response, so it cannot exit and
+		// collapse the sandbox PID namespace mid-POST. Answering first
+		// would leave the POST racing the agent's exit, which is the bug
+		// this commit fixes, only at a smaller scale. The cost is that a
+		// slow server delays the tool response, bounded by the worker's
+		// per-invocation timeout. A failed POST is logged, not fatal:
+		// `verdict_posted` stays false so the next request retries.
+		if let Some(verify) = &session.verify {
+			if let Err(e) = post_locked_verdict(&session, verify).await {
+				tracing::warn!(error = %e, "loupe-mcp: verdict POST failed; will retry");
+			}
+		}
+
 		write_response(&mut stdout, &response)?;
 	}
 
-	if session.verify.is_some() {
-		flush_verify_session(&session).await?;
+	// Stdin closed. Anything still undelivered gets one last attempt, and
+	// a session that produced no verdict at all is a verifier failure, so
+	// both surface as errors: the runner then posts `complete(failed)`
+	// rather than completing a job the server would reject for having no
+	// verdict. Under the sandbox this is usually unreachable, since the
+	// child is killed before EOF; it matters for clients that close stdin
+	// and wait, and for `mcp-serve` driven directly.
+	if let Some(verify) = &session.verify {
+		post_locked_verdict(&session, verify)
+			.await
+			.context("verify session ended with an undelivered verdict")?;
+		if !verify.inner.lock().await.verdict_posted {
+			anyhow::bail!(
+				"verify session ended without `submit_verdict` being called; the verifier \
+				 agent produced no verdict"
+			);
+		}
 	}
 
 	Ok(())
@@ -961,12 +994,20 @@ async fn tool_submit_patch(session: &Arc<Session>, args: &Value) -> Result<Strin
 		},
 	}
 
+	// The patch has no delivery path: it used to ride the verdict POST,
+	// which now goes out before any patch exists. Log the body so the
+	// agent's work is at least recoverable from worker logs until a
+	// route for it exists.
+	tracing::info!(
+		finding_id = verify.finding_id,
+		patch = %patch_unified,
+		notes = %notes,
+		"loupe-mcp: agent submitted verifier patch (buffered; no delivery path yet)",
+	);
 	inner.patch = Some(loupe_core::VerdictPatch { patch_unified, notes });
 
-	tracing::info!(finding_id = verify.finding_id, "loupe-mcp: agent submitted verifier patch",);
-
-	Ok("Patch buffered. End the session when you're done; the verdict and patch \
-	    will be POSTed together to the server in a single request."
+	Ok("Patch accepted and it applies cleanly. The verdict is submitted \
+	    separately; end the session when you're done."
 		.into())
 }
 
@@ -1057,68 +1098,44 @@ fn write_response<W: Write>(w: &mut W, resp: &Response) -> Result<()> {
 	Ok(())
 }
 
-/// End-of-session flush for verify mode: take the buffered verdict
-/// (and patch, if any), merge them into a single
-/// `Verdict::Confirmed { ..., patch }` (or pass through unchanged
-/// for non-Confirmed variants), and POST one `VerdictSubmission` to
-/// `/v1/jobs/{job_id}/verdict`.
+/// POST the locked verdict to `/v1/jobs/{job_id}/verdict`, once.
 ///
-/// Errors propagate up through `run_stdio_server`'s return so the
-/// runner posts `complete(failed)` and the validating-deadline
-/// reaper later marks the verdict inconclusive. In particular: if
-/// the agent never called `submit_verdict`, that's a verifier
-/// failure — the agent didn't do its job — and we surface the
-/// failure rather than silently letting the verify slot stay open.
-async fn flush_verify_session(session: &Arc<Session>) -> Result<()> {
-	let verify = session.verify.as_ref().expect("flush_verify_session: verify state required");
-	let job_id = session
-		.job_id
-		.context("flush_verify_session: verify mode requires --job-id (checked at startup)")?;
-
-	let inner = verify.inner.lock().await;
-	let verdict = inner.verdict.clone().context(
-		"verify session ended without `submit_verdict` being called. \
-		 The verifier agent didn't produce a verdict — treating as a \
-		 session failure so the runner reports the job failed and the \
-		 validating-deadline reaper picks up the slack.",
-	)?;
-	let patch = inner.patch.clone();
-	drop(inner);
-
-	// Merge: a buffered patch only attaches to a Confirmed verdict.
-	// `submit_patch` already enforces this (it refuses to buffer when
-	// the verdict isn't Confirmed), but the merge makes the invariant
-	// explicit at flush time too.
-	let final_verdict = match verdict {
-		loupe_core::Verdict::Confirmed { notes, patch: existing } => {
-			loupe_core::Verdict::Confirmed {
-				notes,
-				// If somehow both fields carry a patch (impossible by the
-				// tool plumbing), prefer the buffered one — the in-session
-				// `submit_patch` is the path the operator wired the audit
-				// columns through.
-				patch: patch.or(existing),
-			}
-		},
-		other => other,
+/// Called from the request loop after every tool call so the verdict
+/// reaches the server the moment `submit_verdict` locks it, well
+/// before the agent exits and the kernel tears down the sandbox PID
+/// namespace. `verdict_posted` is set only on success, so a transient
+/// failure is retried on the next request; if the agent never called
+/// `submit_verdict` there is nothing to post and the job's completion
+/// check fails it into a clean retry.
+///
+/// The buffered patch is not attached: it used to ride this POST at
+/// session end, but the verdict now goes out before the patch is
+/// known. Delivering the proposed patch independently is a follow-up.
+async fn post_locked_verdict(session: &Arc<Session>, verify: &VerifySessionState) -> Result<()> {
+	let verdict = {
+		let inner = verify.inner.lock().await;
+		if inner.verdict_posted {
+			return Ok(());
+		}
+		let Some(verdict) = inner.verdict.clone() else { return Ok(()) };
+		verdict
 	};
+	let job_id = session.job_id.context("verify mode requires --job-id (checked at startup)")?;
 
-	tracing::info!(
-		finding_id = verify.finding_id,
-		job_id,
-		"loupe-mcp: flushing verify session verdict",
-	);
 	session
 		.client
 		.submit_verdict(
 			job_id,
 			&loupe_proto::VerdictSubmission {
 				protocol_version: loupe_proto::PROTOCOL_VERSION,
-				verdict: final_verdict,
+				verdict,
 			},
 		)
 		.await
-		.context("POSTing buffered verdict to /v1/jobs/:id/verdict")?;
+		.context("POSTing verdict to /v1/jobs/:id/verdict")?;
+
+	verify.inner.lock().await.verdict_posted = true;
+	tracing::info!(finding_id = verify.finding_id, job_id, "loupe-mcp: verdict POSTed");
 	Ok(())
 }
 
@@ -1191,14 +1208,16 @@ mod tests {
 	}
 
 	fn fake_session_for_verify(finding_id: i64) -> Arc<Session> {
-		// `submit_verdict` / `submit_patch` only buffer locally; they
-		// don't hit the network until `flush_verify_session` runs at
-		// session end. So a no-op ServerClient (default reqwest +
-		// any URL) is fine for the locking tests below.
-		let client = Arc::new(ServerClient::from_parts(
-			reqwest::Client::new(),
-			"http://invalid.example/".parse().unwrap(),
-		));
+		// `submit_verdict` / `submit_patch` only buffer locally; the
+		// network POST happens in `run_stdio_server`'s request loop,
+		// which these tool-level tests don't drive. So a no-op
+		// ServerClient (default reqwest + any URL) is fine here.
+		verify_session_against(finding_id, "http://invalid.example/")
+	}
+
+	fn verify_session_against(finding_id: i64, base: &str) -> Arc<Session> {
+		let client =
+			Arc::new(ServerClient::from_parts(reqwest::Client::new(), base.parse().unwrap()));
 		Arc::new(Session {
 			client,
 			repo_id: 1,
@@ -1209,6 +1228,91 @@ mod tests {
 				inner: tokio::sync::Mutex::new(VerifySessionInner::default()),
 			}),
 		})
+	}
+
+	/// Minimal HTTP stub for the verdict endpoint: replies with each
+	/// status in turn (repeating the last), counting requests. Enough for
+	/// `submit_verdict`, which only inspects the status line. `connection:
+	/// close` keeps one connection per request so the count is exact.
+	async fn verdict_stub(statuses: Vec<u16>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let counter = hits.clone();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut sock, _)) = listener.accept().await else { return };
+				let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				let status = *statuses.get(n).or_else(|| statuses.last()).unwrap_or(&204);
+				let mut buf = [0u8; 4096];
+				let _ = sock.read(&mut buf).await;
+				let body = if status == 204 { "" } else { "stub rejected the verdict" };
+				// `ensure_ok` requires the protocol header on every response.
+				let resp = format!(
+					"HTTP/1.1 {status} STUB\r\n{}: {PROTOCOL_VERSION}\r\ncontent-length: {}\r\n\
+					 connection: close\r\n\r\n{body}",
+					loupe_proto::PROTOCOL_VERSION_HEADER,
+					body.len(),
+				);
+				let _ = sock.write_all(resp.as_bytes()).await;
+				let _ = sock.shutdown().await;
+			}
+		});
+		(format!("http://{addr}/"), hits)
+	}
+
+	#[tokio::test]
+	async fn verdict_posts_exactly_once_however_many_times_the_loop_calls() {
+		use std::sync::atomic::Ordering;
+
+		let (base, hits) = verdict_stub(vec![204]).await;
+		let session = verify_session_against(7, &base);
+		let verify = session.verify.as_ref().unwrap();
+
+		// Request loop runs this after every tool call, so it must be a
+		// no-op until a verdict is actually locked.
+		post_locked_verdict(&session, verify).await.expect("no verdict is not an error");
+		assert_eq!(hits.load(Ordering::SeqCst), 0, "must not POST before a verdict is locked");
+
+		tool_submit_verdict(&session, &json!({ "verdict": "confirmed", "notes": "real bug" }))
+			.await
+			.expect("verdict accepted");
+
+		for _ in 0..3 {
+			post_locked_verdict(&session, verify).await.expect("post succeeds");
+		}
+		// The endpoint plain-INSERTs and finding_verifications has no
+		// unique constraint, so a second POST would add a duplicate
+		// verdict row. `verdict_posted` is the only thing preventing it.
+		assert_eq!(hits.load(Ordering::SeqCst), 1, "verdict must reach the server exactly once");
+	}
+
+	#[tokio::test]
+	async fn failed_verdict_post_is_retried_on_the_next_call() {
+		use std::sync::atomic::Ordering;
+
+		let (base, hits) = verdict_stub(vec![500, 204]).await;
+		let session = verify_session_against(9, &base);
+		let verify = session.verify.as_ref().unwrap();
+		tool_submit_verdict(
+			&session,
+			&json!({ "verdict": "dismissed", "notes": "false positive" }),
+		)
+		.await
+		.expect("verdict accepted");
+
+		post_locked_verdict(&session, verify).await.expect_err("server 500 must surface");
+		assert_eq!(hits.load(Ordering::SeqCst), 1);
+		assert!(
+			!verify.inner.lock().await.verdict_posted,
+			"a failed POST must leave the verdict undelivered so it is retried",
+		);
+
+		post_locked_verdict(&session, verify).await.expect("retry succeeds");
+		assert_eq!(hits.load(Ordering::SeqCst), 2);
+		assert!(verify.inner.lock().await.verdict_posted);
 	}
 
 	#[tokio::test]
