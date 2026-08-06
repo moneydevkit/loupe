@@ -77,6 +77,18 @@
         packages = {
           default = loupe;
           inherit loupe;
+
+          # One-time post-switch setup on a deployed box: mints certs,
+          # stashes the admin bundle, registers the worker. The deploy
+          # flake installs it as `loupe-bootstrap`.
+          bootstrap = pkgs.writeShellApplication {
+            name = "loupe-bootstrap";
+            runtimeInputs = [
+              loupe
+              pkgs.jq
+            ];
+            text = builtins.readFile ./nix/bootstrap.sh;
+          };
         }
         # Binary release, linux-x64 only.
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {

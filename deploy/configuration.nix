@@ -6,8 +6,8 @@
 #      and run `sops updatekeys secrets.yaml`.
 #   2. Set the service's dedicated OpenRouter key: see .sops.yaml.
 #   3. Replace hardware-configuration.nix with the box's own.
-# After the first switch, run the one-time bootstrap (see nix/bootstrap.sh)
-# to mint certs and register the worker.
+# After the first switch, run `sudo loupe-bootstrap` on the box to mint
+# certs and register the worker.
 {
   config,
   lib,
@@ -84,7 +84,10 @@ in
     OPENAI_API_KEY=${config.sops.placeholder.openrouter-api-key}
   '';
 
-  environment.systemPackages = [ loupectl-admin ];
+  environment.systemPackages = [
+    loupectl-admin
+    loupePkgs.bootstrap
+  ];
 
   services.loupe = {
     server = {
