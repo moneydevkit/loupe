@@ -134,6 +134,13 @@ in
     CODEX_HOME = "${codexHome}";
   };
 
+  # bkb-mcp on the worker PATH: loupe probes for it and, when present,
+  # attaches the Bitcoin Knowledge Base tools to the discovery agent for
+  # bitcoin/lightning projects. The store path binds into the sandbox
+  # like every other /nix/store dependency. This list merges with the
+  # module's own worker PATH (git + bubblewrap + agent CLIs).
+  systemd.services.loupe-worker.path = [ loupePkgs.bkb-mcp ];
+
   # `nix build ./deploy` local VM: the same system, deployable on any
   # machine with KVM. Root disk (./loupe.qcow2) persists across runs, so
   # state survives like a physical box; the host /nix/store is mounted

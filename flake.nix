@@ -90,6 +90,10 @@
             text = builtins.readFile ./nix/bootstrap.sh;
           };
         }
+        // {
+          # Bitcoin Knowledge Base MCP server for the discovery agent.
+          bkb-mcp = pkgs.callPackage ./nix/bkb-mcp.nix { };
+        }
         # Binary release, linux-x64 only.
         // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           kimi-code = pkgs.callPackage ./nix/kimi-code.nix { };
