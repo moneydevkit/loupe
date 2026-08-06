@@ -188,6 +188,7 @@ async fn register_with(
 			branch: None,
 			scan_interval_seconds: None,
 			reporting,
+			clone_pat: None,
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval,

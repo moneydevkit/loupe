@@ -43,6 +43,13 @@ pub struct RegisterRepoRequest {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub scan_interval_seconds: Option<u64>,
 	pub reporting: ReportingSetup,
+	/// Credential for cloning the repo itself when it's private (e.g. a
+	/// fine-grained PAT with read-only Contents scope). Unlike the
+	/// reporting PAT, this one is shipped to workers in the job lease —
+	/// that is its entire purpose. `None` means the repo clones
+	/// anonymously.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub clone_pat: Option<String>,
 	#[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
 	pub scanner_config: serde_json::Value,
 	/// Per-repo override of the verify flow. `None` (the default on
@@ -67,6 +74,7 @@ impl RegisterRepoRequest {
 			branch: None,
 			scan_interval_seconds: None,
 			reporting,
+			clone_pat: None,
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: None,
 			require_approval: None,
@@ -85,6 +93,15 @@ pub struct RegisterRepoResponse {
 pub struct RotateRepoPatRequest {
 	pub protocol_version: u16,
 	pub github_pat: String,
+}
+
+/// Body of `PUT /v1/repos/:id/clone-pat`. `clone_pat: None` clears the
+/// stored credential, returning the repo to anonymous cloning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetRepoClonePatRequest {
+	pub protocol_version: u16,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub clone_pat: Option<String>,
 }
 
 /// Body of `PUT /v1/repos/:id/reporting/github`.
@@ -207,6 +224,11 @@ pub struct RepoSummary {
 	/// server that predates it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reporting: Option<ReportingSummary>,
+	/// Whether a clone credential is stored for this repo. The
+	/// credential itself never travels back out of the server on admin
+	/// routes.
+	#[serde(default)]
+	pub has_clone_pat: bool,
 }
 
 /// Body of `POST /v1/workers` (admin-only). Returns the freshly-minted
@@ -245,6 +267,7 @@ mod tests {
 				target_repo: "security".into(),
 				github_pat: "ghp_xxx".into(),
 			},
+			clone_pat: Some("ghp_clone".into()),
 			scanner_config: json!({"regex": {"enabled": true}}),
 			verification_enabled: Some(true),
 			require_approval: Some(false),
@@ -285,6 +308,7 @@ mod tests {
 			last_scanned_at: None,
 			created_at: 42,
 			reporting,
+			has_clone_pat: false,
 		}
 	}
 
@@ -352,6 +376,33 @@ mod tests {
 		assert!(!s.contains("reporting"), "absent reporting should not be serialized: {s}");
 		let back: RepoSummary = serde_json::from_str(&s).unwrap();
 		assert_eq!(back.reporting, None);
+	}
+
+	#[test]
+	fn register_repo_request_omits_absent_clone_pat() {
+		let req =
+			RegisterRepoRequest::new("https://github.com/acme/widget.git", ReportingSetup::Manual);
+		let s = serde_json::to_string(&req).unwrap();
+		assert!(!s.contains("clone_pat"), "public repos should not mention clone_pat: {s}");
+		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();
+		assert_eq!(back.clone_pat, None);
+	}
+
+	#[test]
+	fn set_repo_clone_pat_request_none_means_clear() {
+		let set = SetRepoClonePatRequest {
+			protocol_version: PROTOCOL_VERSION,
+			clone_pat: Some("ghp_clone".into()),
+		};
+		let s = serde_json::to_string(&set).unwrap();
+		let back: SetRepoClonePatRequest = serde_json::from_str(&s).unwrap();
+		assert_eq!(set, back);
+
+		let clear = SetRepoClonePatRequest { protocol_version: PROTOCOL_VERSION, clone_pat: None };
+		let s = serde_json::to_string(&clear).unwrap();
+		assert!(!s.contains("clone_pat"));
+		let back: SetRepoClonePatRequest = serde_json::from_str(&s).unwrap();
+		assert_eq!(back.clone_pat, None);
 	}
 
 	#[test]

@@ -191,6 +191,7 @@ async fn run_flow(
 				target_repo: "tracker".into(),
 				github_pat: "ghp_pat".into(),
 			},
+			clone_pat: None,
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(true),
 			require_approval: None,

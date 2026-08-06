@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
 		.route("/v1/repos/{id}", delete(routes::repos::delete).patch(routes::repos::update))
 		.route("/v1/repos/{id}/reporting/github-pat", post(routes::repos::rotate_github_pat))
 		.route("/v1/repos/{id}/reporting/github", put(routes::repos::set_github_reporting))
+		.route("/v1/repos/{id}/clone-pat", put(routes::repos::set_clone_pat))
 		.route("/v1/repos/{id}/scan", post(routes::jobs::enqueue_scan))
 		.route("/v1/repos/{id}/findings", get(routes::findings_admin::list_for_repo))
 		.route("/v1/findings/retry-verify", post(routes::findings_admin::retry_verify))

@@ -75,12 +75,17 @@ impl std::fmt::Debug for MasterKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
 	GithubPat,
+	/// Read-only credential a worker embeds in the clone URL for
+	/// private repos. Unlike `GithubPat`, this one is shipped in the
+	/// lease envelope by design.
+	ClonePat,
 }
 
 impl SecretKind {
 	pub fn as_str(self) -> &'static str {
 		match self {
 			SecretKind::GithubPat => "github_pat",
+			SecretKind::ClonePat => "clone_pat",
 		}
 	}
 }
@@ -105,6 +110,43 @@ pub fn read(conn: &Connection, id: i64) -> rusqlite::Result<Option<Vec<u8>>> {
 		r.get::<_, Vec<u8>>(0)
 	})
 	.optional()
+}
+
+/// Insert or replace a secret addressed by its `(kind, label)` natural
+/// key. Used for per-repo clone credentials, which are keyed by clone
+/// URL instead of being referenced by id — that keeps them out of the
+/// repos schema entirely, so the fork carries no migration of its own.
+pub fn upsert_by_label(
+	conn: &Connection, kind: SecretKind, label: &str, value: &[u8], now: i64,
+) -> rusqlite::Result<()> {
+	conn.execute(
+		"INSERT INTO secrets (kind, label, value, created_at)
+		 VALUES (?1, ?2, ?3, ?4)
+		 ON CONFLICT(kind, label)
+		 DO UPDATE SET value = excluded.value, created_at = excluded.created_at",
+		params![kind.as_str(), label, value, now],
+	)?;
+	Ok(())
+}
+
+/// Read a secret by its `(kind, label)` natural key.
+pub fn read_by_label(
+	conn: &Connection, kind: SecretKind, label: &str,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+	conn.query_row(
+		"SELECT value FROM secrets WHERE kind = ?1 AND label = ?2",
+		params![kind.as_str(), label],
+		|r| r.get::<_, Vec<u8>>(0),
+	)
+	.optional()
+}
+
+pub fn delete_by_label(conn: &Connection, kind: SecretKind, label: &str) -> rusqlite::Result<bool> {
+	let n = conn.execute(
+		"DELETE FROM secrets WHERE kind = ?1 AND label = ?2",
+		params![kind.as_str(), label],
+	)?;
+	Ok(n > 0)
 }
 
 pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
@@ -141,6 +183,26 @@ mod tests {
 		let dup =
 			db.with_conn(|c| Ok(insert(c, SecretKind::GithubPat, "tracker-pat", b"b", 1).is_ok()));
 		assert!(matches!(dup, Ok(false) | Err(_)));
+	}
+
+	#[test]
+	fn upsert_by_label_replaces_and_read_delete_by_label_round_trip() {
+		let db = Db::open_in_memory(&MasterKey::for_tests()).unwrap();
+		let url = "https://github.com/acme/private.git";
+		db.with_conn(|c| Ok(upsert_by_label(c, SecretKind::ClonePat, url, b"ghp_old", 1)?))
+			.unwrap();
+		db.with_conn(|c| Ok(upsert_by_label(c, SecretKind::ClonePat, url, b"ghp_new", 2)?))
+			.unwrap();
+		let v = db.with_conn(|c| Ok(read_by_label(c, SecretKind::ClonePat, url)?)).unwrap();
+		assert_eq!(v.as_deref(), Some(&b"ghp_new"[..]));
+		// Same label under a different kind is a distinct secret.
+		let other = db.with_conn(|c| Ok(read_by_label(c, SecretKind::GithubPat, url)?)).unwrap();
+		assert!(other.is_none());
+
+		assert!(db.with_conn(|c| Ok(delete_by_label(c, SecretKind::ClonePat, url)?)).unwrap());
+		assert!(!db.with_conn(|c| Ok(delete_by_label(c, SecretKind::ClonePat, url)?)).unwrap());
+		let v = db.with_conn(|c| Ok(read_by_label(c, SecretKind::ClonePat, url)?)).unwrap();
+		assert!(v.is_none());
 	}
 
 	#[test]

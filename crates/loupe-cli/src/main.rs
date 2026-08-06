@@ -13,7 +13,7 @@ use loupe_proto::{
 	FindingDetail, JobInfo, ListFindingsResponse, ListReposResponse, RegisterRepoRequest,
 	RegisterRepoResponse, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
 	RetryVerifyRequest, RetryVerifyResponse, RotateRepoPatRequest, ScanRequest, ScanResponse,
-	SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
+	SetRepoClonePatRequest, SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -78,6 +78,9 @@ enum RepoCmd {
 	RotatePat(RepoRotatePatArgs),
 	/// Configure or replace this repo's GitHub issue reporter.
 	SetGithubReporting(RepoSetGithubReportingArgs),
+	/// Set, replace, or clear the credential workers use to clone this
+	/// repo (needed for private repos).
+	SetClonePat(RepoSetClonePatArgs),
 	/// Trigger a scan now.
 	Scan {
 		id: i64,
@@ -106,6 +109,25 @@ struct RepoSetGithubReportingArgs {
 	/// omitted.
 	#[arg(long, env = "LOUPE_TRACKER_PAT", hide_env_values = true)]
 	pat: String,
+}
+
+#[derive(Debug, Args)]
+struct RepoSetClonePatArgs {
+	id: i64,
+	/// Clone credential, e.g. a fine-grained PAT with read-only Contents
+	/// scope on just this repo. Shipped to workers in the job lease,
+	/// unlike the reporting PAT. Read from LOUPE_CLONE_PAT if omitted.
+	#[arg(
+		long,
+		env = "LOUPE_CLONE_PAT",
+		hide_env_values = true,
+		required_unless_present = "clear",
+		conflicts_with = "clear"
+	)]
+	pat: Option<String>,
+	/// Remove the stored credential; the repo clones anonymously again.
+	#[arg(long, default_value_t = false)]
+	clear: bool,
 }
 
 #[derive(Debug, Args)]
@@ -170,6 +192,12 @@ struct RepoAddArgs {
 		required_unless_present = "no_reporting"
 	)]
 	pat: Option<String>,
+	/// Credential for cloning the repo itself when it's private, e.g. a
+	/// fine-grained PAT with read-only Contents scope on just this repo.
+	/// Shipped to workers in the job lease, unlike the reporting PAT.
+	/// Read from LOUPE_CLONE_PAT if omitted.
+	#[arg(long, env = "LOUPE_CLONE_PAT", hide_env_values = true)]
+	clone_pat: Option<String>,
 	/// Skip configuring an automatic reporter. Findings still go
 	/// through the full scan + verification + approval pipeline.
 	/// Confirmed findings remain `confirmed` so operators can configure
@@ -374,6 +402,10 @@ async fn main() -> Result<()> {
 				let (client, base) = client_and_url(&conn)?;
 				repo_set_github_reporting(&client, base, a).await
 			},
+			RepoCmd::SetClonePat(a) => {
+				let (client, base) = client_and_url(&conn)?;
+				repo_set_clone_pat(&client, base, a).await
+			},
 			RepoCmd::Scan { id, incremental } => {
 				let (client, base) = client_and_url(&conn)?;
 				repo_scan(&client, base, id, incremental).await
@@ -543,6 +575,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 		branch: a.branch,
 		scan_interval_seconds: a.scan_interval_seconds,
 		reporting,
+		clone_pat: a.clone_pat,
 		scanner_config: serde_json::Value::Null,
 		verification_enabled,
 		require_approval,
@@ -635,6 +668,21 @@ async fn repo_rotate_pat(
 	let status = resp.status();
 	if !status.is_success() {
 		anyhow::bail!("rotate repo PAT: {} — {}", status, resp.text().await.unwrap_or_default());
+	}
+	Ok(())
+}
+
+async fn repo_set_clone_pat(
+	client: &reqwest::Client, base: &reqwest::Url, a: RepoSetClonePatArgs,
+) -> Result<()> {
+	// clap guarantees exactly one of --pat / --clear, so `a.pat` is
+	// None exactly when clearing.
+	let req = SetRepoClonePatRequest { protocol_version: PROTOCOL_VERSION, clone_pat: a.pat };
+	let resp =
+		client.put(url(base, &format!("/v1/repos/{}/clone-pat", a.id))).json(&req).send().await?;
+	let status = resp.status();
+	if !status.is_success() {
+		anyhow::bail!("set clone PAT: {} — {}", status, resp.text().await.unwrap_or_default());
 	}
 	Ok(())
 }
@@ -1069,6 +1117,53 @@ mod tests {
 		};
 		assert_eq!(args.id, 7);
 		assert_eq!(args.pat, "ghp_replacement");
+	}
+
+	#[test]
+	fn repo_set_clone_pat_parses_pat_and_clear_but_not_both() {
+		let base = ["loupectl", "--server-url", "https://loupe.example:8443"];
+
+		let cli = Cli::try_parse_from(base.iter().copied().chain([
+			"repo",
+			"set-clone-pat",
+			"7",
+			"--pat",
+			"ghp_clone",
+		]))
+		.unwrap();
+		let Cmd::Repo(RepoCmd::SetClonePat(args)) = cli.cmd else {
+			panic!("expected repo set-clone-pat command");
+		};
+		assert_eq!(args.id, 7);
+		assert_eq!(args.pat.as_deref(), Some("ghp_clone"));
+		assert!(!args.clear);
+
+		let cli = Cli::try_parse_from(base.iter().copied().chain([
+			"repo",
+			"set-clone-pat",
+			"7",
+			"--clear",
+		]))
+		.unwrap();
+		let Cmd::Repo(RepoCmd::SetClonePat(args)) = cli.cmd else {
+			panic!("expected repo set-clone-pat command");
+		};
+		assert_eq!(args.pat, None);
+		assert!(args.clear);
+
+		let both = Cli::try_parse_from(base.iter().copied().chain([
+			"repo",
+			"set-clone-pat",
+			"7",
+			"--pat",
+			"x",
+			"--clear",
+		]));
+		assert!(both.is_err(), "--pat and --clear must conflict");
+
+		let neither =
+			Cli::try_parse_from(base.iter().copied().chain(["repo", "set-clone-pat", "7"]));
+		assert!(neither.is_err(), "one of --pat / --clear is required");
 	}
 
 	#[test]

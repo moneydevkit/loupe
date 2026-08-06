@@ -11,8 +11,8 @@ use loupe_proto::{
 	CompleteOutcome, CompleteRequest, FindingDetail, FindingsBatch, HeartbeatRequest, JobInfo,
 	LeaseEnvelope, LeasePayload, LeaseRequest, LeaseResponse, ListFindingsResponse,
 	RegisterRepoRequest, RegisterWorkerRequest, RegisterWorkerResponse, ReportingSetup,
-	RetryVerifyRequest, RetryVerifyResponse, ScanRequest, ScanResponse, VerdictSubmission,
-	PROTOCOL_VERSION,
+	RetryVerifyRequest, RetryVerifyResponse, ScanRequest, ScanResponse, SetRepoClonePatRequest,
+	VerdictSubmission, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
 use loupe_server::{serve, AppState, Config};
@@ -88,6 +88,7 @@ async fn bring_up_with_repo_and_worker() -> Fixture {
 			target_repo: "tracker".into(),
 			github_pat: "ghp".into(),
 		},
+		clone_pat: None,
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: Some(false),
 		require_approval: None,
@@ -122,6 +123,7 @@ async fn register_repo(f: &Fixture, clone_url: &str, target_repo: &str) -> i64 {
 			target_repo: target_repo.into(),
 			github_pat: "ghp".into(),
 		},
+		clone_pat: None,
 		scanner_config: serde_json::Value::Null,
 		verification_enabled: Some(false),
 		require_approval: None,
@@ -2203,4 +2205,86 @@ async fn empty_queue_returns_empty_lease_response() {
 	let body: LeaseResponse = resp.json().await.unwrap();
 	assert!(matches!(body, LeaseResponse::Empty { .. }));
 	f.handle.shutdown().await;
+}
+
+/// Register a repo carrying a clone credential, reporting disabled —
+/// the private-repo shape. Distinct URL per call; the fixture repo
+/// stays credential-free.
+async fn register_private_repo(f: &Fixture, clone_url: &str, clone_pat: &str) -> i64 {
+	let req = RegisterRepoRequest {
+		protocol_version: PROTOCOL_VERSION,
+		clone_url: clone_url.into(),
+		branch: Some("main".into()),
+		scan_interval_seconds: None,
+		reporting: ReportingSetup::Manual,
+		clone_pat: Some(clone_pat.into()),
+		scanner_config: serde_json::Value::Null,
+		verification_enabled: Some(false),
+		require_approval: None,
+	};
+	let resp = f.admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
+	assert_eq!(resp.status(), 201);
+	let body: serde_json::Value = resp.json().await.unwrap();
+	body["repo_id"].as_i64().unwrap()
+}
+
+async fn put_clone_pat(f: &Fixture, repo_id: i64, clone_pat: Option<&str>) {
+	let req = SetRepoClonePatRequest {
+		protocol_version: PROTOCOL_VERSION,
+		clone_pat: clone_pat.map(String::from),
+	};
+	let resp = f
+		.admin
+		.put(format!("https://loupe-server/v1/repos/{repo_id}/clone-pat"))
+		.json(&req)
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+}
+
+#[tokio::test]
+async fn lease_ships_clone_pat_only_when_one_is_stored() {
+	let f = bring_up_with_repo_and_worker().await;
+
+	// The fixture repo has no clone credential: anonymous clone.
+	enqueue_scan(&f, f.repo_id).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.github_pat, None, "public repo must lease without a credential");
+
+	// Registered with a credential: the lease carries it.
+	let with_pat =
+		register_private_repo(&f, "https://github.com/acme/private.git", "ghp_clone").await;
+	enqueue_scan(&f, with_pat).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.github_pat.as_deref(), Some("ghp_clone"));
+
+	// Rotated before the scan: the lease carries the replacement.
+	let rotated = register_private_repo(&f, "https://github.com/acme/rotated.git", "ghp_old").await;
+	put_clone_pat(&f, rotated, Some("ghp_new")).await;
+	enqueue_scan(&f, rotated).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.github_pat.as_deref(), Some("ghp_new"));
+
+	// Cleared: back to anonymous.
+	let cleared =
+		register_private_repo(&f, "https://github.com/acme/cleared.git", "ghp_gone").await;
+	put_clone_pat(&f, cleared, None).await;
+	enqueue_scan(&f, cleared).await;
+	let env = lease_job(&f.worker).await;
+	assert_eq!(env.github_pat, None, "cleared credential must not ride later leases");
+
+	// The credential never leaks through admin listing; only its
+	// presence does.
+	let resp = f.admin.get("https://loupe-server/v1/repos").send().await.unwrap();
+	let body: serde_json::Value = resp.json().await.unwrap();
+	let text = body.to_string();
+	assert!(!text.contains("ghp_clone") && !text.contains("ghp_new"), "PAT leaked: {text}");
+	let repos = body["repos"].as_array().unwrap();
+	let by_id = |id: i64| {
+		repos.iter().find(|r| r["id"].as_i64() == Some(id)).unwrap_or_else(|| panic!("repo {id}"))
+	};
+	assert_eq!(by_id(with_pat)["has_clone_pat"], true);
+	assert_eq!(by_id(cleared)["has_clone_pat"], false);
+	assert_eq!(by_id(f.repo_id)["has_clone_pat"], false);
 }

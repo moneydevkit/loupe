@@ -8,7 +8,8 @@ use axum::Json;
 use loupe_core::ReportingDestination;
 use loupe_proto::{
 	ListReposResponse, RegisterRepoRequest, RegisterRepoResponse, RepoSummary, ReportingSetup,
-	RotateRepoPatRequest, SetRepoGithubReportingRequest, UpdateRepoRequest, PROTOCOL_VERSION,
+	RotateRepoPatRequest, SetRepoClonePatRequest, SetRepoGithubReportingRequest, UpdateRepoRequest,
+	PROTOCOL_VERSION,
 };
 use loupe_storage::repos::{self, NewRepo, RepoRow, RepoUpdate};
 use loupe_storage::secrets::{self, SecretKind};
@@ -16,7 +17,7 @@ use serde::Deserialize;
 
 use crate::state::AppState;
 
-fn row_to_summary(r: RepoRow) -> RepoSummary {
+fn row_to_summary(r: RepoRow, has_clone_pat: bool) -> RepoSummary {
 	RepoSummary {
 		reporting: Some((&r.reporting).into()),
 		id: r.id,
@@ -32,6 +33,7 @@ fn row_to_summary(r: RepoRow) -> RepoSummary {
 		last_scanned_sha: r.last_scanned_sha,
 		last_scanned_at: r.last_scanned_at,
 		created_at: r.created_at,
+		has_clone_pat,
 	}
 }
 
@@ -64,12 +66,29 @@ pub async fn create(
 		.ok_or((StatusCode::BAD_REQUEST, "clone_url must be an https or file URL".into()))?;
 	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
+	if matches!(&req.clone_pat, Some(p) if p.trim().is_empty()) {
+		return Err((StatusCode::BAD_REQUEST, "clone PAT must not be empty".into()));
+	}
+
 	let new_repo_id = state
 		.db
 		.with_conn(|c| {
 			// One transaction so a partially-inserted secret can't outlive
 			// a failed repo insert.
 			let tx = c.transaction()?;
+			// The clone credential is keyed by (kind = clone_pat, label =
+			// clone_url) instead of a repos column, so the fork carries no
+			// schema migration that could collide with upstream's.
+			// clone_url is UNIQUE on repos, so the mapping is one-to-one.
+			if let Some(pat) = &req.clone_pat {
+				secrets::upsert_by_label(
+					&tx,
+					SecretKind::ClonePat,
+					&req.clone_url,
+					pat.as_bytes(),
+					now,
+				)?;
+			}
 			let reporting = match &req.reporting {
 				ReportingSetup::GithubIssue { target_owner, target_repo, github_pat } => {
 					let secret_label = format!("pat:{}:{}/{}", parsed.0, target_owner, target_repo);
@@ -130,14 +149,20 @@ pub async fn list(
 	State(state): State<AppState>, Query(qp): Query<ListQuery>,
 ) -> Result<Json<ListReposResponse>, (StatusCode, String)> {
 	let limit = positive_limit(qp.limit)?;
-	let rows = state
+	let summaries = state
 		.db
-		.with_conn(|c| Ok(repos::list(c, limit)?))
+		.with_conn(|c| {
+			repos::list(c, limit)?
+				.into_iter()
+				.map(|r| {
+					let has_clone_pat =
+						secrets::read_by_label(c, SecretKind::ClonePat, &r.clone_url)?.is_some();
+					Ok(row_to_summary(r, has_clone_pat))
+				})
+				.collect()
+		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listing repos: {e}")))?;
-	Ok(Json(ListReposResponse {
-		protocol_version: PROTOCOL_VERSION,
-		repos: rows.into_iter().map(row_to_summary).collect(),
-	}))
+	Ok(Json(ListReposResponse { protocol_version: PROTOCOL_VERSION, repos: summaries }))
 }
 
 /// `PATCH /v1/repos/:id` — admin only. Toggles `disabled`, swaps the
@@ -253,6 +278,52 @@ pub async fn rotate_github_pat(
 	Ok(StatusCode::NO_CONTENT)
 }
 
+/// `PUT /v1/repos/:id/clone-pat` — admin only. Sets, replaces, or (with
+/// `clone_pat: null`) clears the credential workers use to clone this
+/// repo. Unlike the reporting PAT, this secret ships to workers in the
+/// lease envelope — that is its purpose.
+pub async fn set_clone_pat(
+	State(state): State<AppState>, Path(id): Path<i64>, Json(req): Json<SetRepoClonePatRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+	if req.protocol_version != PROTOCOL_VERSION {
+		return Err((
+			StatusCode::BAD_REQUEST,
+			format!("unsupported protocol_version {}", req.protocol_version),
+		));
+	}
+	if matches!(&req.clone_pat, Some(p) if p.trim().is_empty()) {
+		return Err((StatusCode::BAD_REQUEST, "clone PAT must not be empty".into()));
+	}
+
+	let row = state
+		.db
+		.with_conn(|c| Ok(repos::get(c, id)?))
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get repo: {e}")))?
+		.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repo with id {id}")))?;
+
+	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+	state
+		.db
+		.with_conn(|c| {
+			match &req.clone_pat {
+				Some(pat) => secrets::upsert_by_label(
+					c,
+					SecretKind::ClonePat,
+					&row.clone_url,
+					pat.as_bytes(),
+					now,
+				)?,
+				None => {
+					secrets::delete_by_label(c, SecretKind::ClonePat, &row.clone_url)?;
+				},
+			}
+			Ok(())
+		})
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set clone PAT: {e}")))?;
+
+	Ok(StatusCode::NO_CONTENT)
+}
+
 /// `PUT /v1/repos/:id/reporting/github` — admin only. Configures or
 /// replaces the GitHub issue reporting destination for a repo.
 pub async fn set_github_reporting(
@@ -333,13 +404,27 @@ pub async fn set_github_reporting(
 /// `DELETE /v1/repos/:id` — admin only. CASCADEs onto jobs, findings,
 /// scan_history, and verifications via the foreign keys. The secret
 /// linked from `reporting.pat_secret_id` is intentionally **not**
-/// deleted — it might be shared with other repos.
+/// deleted — it might be shared with other repos. The clone credential
+/// IS deleted: it is keyed by this repo's clone_url, so nothing else
+/// can reference it, and leaving it behind would silently attach it to
+/// a future re-registration of the same URL.
 pub async fn delete(
 	State(state): State<AppState>, Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, String)> {
 	let removed = state
 		.db
-		.with_conn(|c| Ok(repos::delete(c, id)?))
+		.with_conn(|c| {
+			let tx = c.transaction()?;
+			let Some(row) = repos::get(&tx, id)? else {
+				return Ok(false);
+			};
+			let removed = repos::delete(&tx, id)?;
+			if removed {
+				secrets::delete_by_label(&tx, SecretKind::ClonePat, &row.clone_url)?;
+			}
+			tx.commit()?;
+			Ok(removed)
+		})
 		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("delete repo: {e}")))?;
 	if removed {
 		Ok(StatusCode::NO_CONTENT)

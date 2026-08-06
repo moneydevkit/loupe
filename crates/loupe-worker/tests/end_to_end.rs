@@ -107,6 +107,7 @@ async fn worker_runs_a_scan_and_emits_a_finding() {
 				target_repo: "y".into(),
 				github_pat: "ghp".into(),
 			},
+			clone_pat: None,
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval: None,

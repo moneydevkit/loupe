@@ -109,6 +109,7 @@ async fn email_reporter_invokes_sendmail_with_findings() {
 				from: Some("loupe@example.com".into()),
 				subject_prefix: Some("[scan]".into()),
 			},
+			clone_pat: None,
 			scanner_config: serde_json::Value::Null,
 			verification_enabled: Some(false),
 			require_approval: None,
