@@ -1,0 +1,27 @@
+# sops config for secrets.yaml.
+#
+# Editing secrets:
+#   nix develop -c sops deploy/secrets.yaml
+# opens $EDITOR on the decrypted file; saving re-encrypts. sops finds the
+# operator key at ~/.config/sops/age/keys.txt on its own. Never pass secret
+# values as command-line arguments; they end up in shell history.
+#
+# Contents:
+#   master-key          SQLCipher database master key, minted for this
+#                       deployment. loupe-server init consumes it via
+#                       LOUPE_MASTER_KEY. Losing every recipient key means
+#                       losing the scanner database.
+#   openrouter-api-key  Dedicated OpenRouter key for this service (not a
+#                       personal one), created at openrouter.ai (Keys).
+#                       Scope or credit-limit it.
+#
+# Admitting the box once it exists:
+#   ssh-to-age < /etc/ssh/ssh_host_ed25519_key.pub   (run on the box)
+# add the result below, then: sops updatekeys secrets.yaml
+keys:
+  - &operator age1vjhlz2h8j5wm8jjfjtg785rzg02yxaj8fx565d67m565qw8uygusadh7nh
+creation_rules:
+  - path_regex: secrets\.yaml$
+    key_groups:
+      - age:
+          - *operator

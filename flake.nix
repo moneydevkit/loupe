@@ -116,6 +116,8 @@
             rust-analyzer
             nixfmt
             jq
+            # Edits deploy/secrets.yaml; see deploy/.sops.yaml.
+            sops
           ];
 
           # loupe's bwrap sandbox can't nest the isolate-wrapped agent
