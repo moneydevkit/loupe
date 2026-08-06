@@ -27,29 +27,6 @@ let
     exec ${config.services.loupe.package}/bin/loupectl "$@"
   '';
 
-  # Both agents route through OpenRouter; neither config carries a secret.
-  # The key arrives via the sops-templated env file, forwarded into the
-  # sandbox by the worker.
-  #
-  # loupe reads KIMI_CODE_HOME host-side and bind-mounts config.toml to
-  # /home/scanner/.kimi-code/config.toml in the sandbox. `--kimi-model`
-  # selects the [models.kimi-k3] alias defined here.
-  kimiHome = pkgs.writeTextDir "config.toml" ''
-    default_model = "kimi-k3"
-    # Print mode (-p) rejects --yolo/--auto, so headless tool approval is
-    # config-driven. "yolo" = approve all; the bwrap sandbox is the boundary.
-    default_permission_mode = "yolo"
-
-    [providers.openrouter]
-    type = "openai"
-    base_url = "https://openrouter.ai/api/v1"
-
-    [models.kimi-k3]
-    provider = "openrouter"
-    model = "moonshotai/kimi-k3"
-    max_context_size = 262144
-  '';
-
   # codex 0.133 removed wire_api = "chat"; OpenRouter serves a
   # Responses-compatible /v1/responses, so "responses" is both required and
   # sufficient. env_key must be OPENAI_API_KEY: the worker forwards only
@@ -77,11 +54,39 @@ in
   sops.age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
   sops.secrets.master-key = { };
   sops.secrets.openrouter-api-key = { };
-  # One OpenRouter key serves both agents: kimi reads OPENAI_API_KEY for
-  # its openai-type provider, codex reads it via the provider's env_key.
+  # Codex reads the OpenRouter key from OPENAI_API_KEY in this env file,
+  # forwarded into the sandbox by the worker.
   sops.templates."loupe-agent.env".content = ''
     OPENAI_API_KEY=${config.sops.placeholder.openrouter-api-key}
   '';
+  # kimi-code 0.34 dropped env-based provider credentials: an openai-type
+  # provider now takes the key inline (`kimi provider list` reports
+  # source=inline), with no env indirection. So its config carries the
+  # key and must be rendered at runtime rather than into the world-
+  # readable store. loupe reads KIMI_CODE_HOME host-side and bind-mounts
+  # config.toml to /home/scanner/.kimi-code/config.toml in the sandbox;
+  # point it at this template's directory. `--kimi-model` (worker
+  # extraArgs) selects the [models.kimi-k3] alias.
+  sops.templates."kimi-config.toml" = {
+    path = "/run/loupe-kimi/config.toml";
+    owner = "loupe-worker";
+    content = ''
+      default_model = "kimi-k3"
+      # Print mode (-p) rejects --yolo/--auto, so headless tool approval is
+      # config-driven. "yolo" = approve all; the bwrap sandbox is the boundary.
+      default_permission_mode = "yolo"
+
+      [providers.openrouter]
+      type = "openai"
+      base_url = "https://openrouter.ai/api/v1"
+      api_key = "${config.sops.placeholder.openrouter-api-key}"
+
+      [models.kimi-k3]
+      provider = "openrouter"
+      model = "moonshotai/kimi-k3"
+      max_context_size = 262144
+    '';
+  };
 
   environment.systemPackages = [
     loupectl-admin
@@ -125,7 +130,7 @@ in
   # Host-side config homes the worker resolves at spawn time to pick its
   # bind-mount sources; the sandbox paths are fixed regardless.
   systemd.services.loupe-worker.environment = {
-    KIMI_CODE_HOME = "${kimiHome}";
+    KIMI_CODE_HOME = builtins.dirOf config.sops.templates."kimi-config.toml".path;
     CODEX_HOME = "${codexHome}";
   };
 
