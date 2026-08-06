@@ -121,7 +121,7 @@
             shims="$PWD/.direnv/agent-shims"
             mkdir -p "$shims"
             rm -f "$shims"/*
-            for tool in claude codex; do
+            for tool in claude codex kimi; do
               if command -v "$tool-unsandboxed" > /dev/null 2>&1; then
                 ln -sf "$(readlink -f "$(command -v "$tool-unsandboxed")")" "$shims/$tool"
               fi
