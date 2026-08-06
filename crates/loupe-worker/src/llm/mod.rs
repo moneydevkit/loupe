@@ -5,7 +5,7 @@
 //! tool loop (the `claude` CLI does this for us; an HTTP backend would
 //! manage one explicitly), and returns the model's final text response.
 //!
-//! Two concrete impls today:
+//! Three concrete impls today:
 //!
 //! - [`ClaudeCliBackend`] shells out to Anthropic's `claude` CLI.
 //!   Carries optional MCP context so each invocation can call back
@@ -13,12 +13,16 @@
 //!   discovery scanner to query prior findings and submit new ones.
 //! - [`CodexCliBackend`] shells out to OpenAI's `codex` CLI. Carries
 //!   the same optional MCP context via Codex CLI config overrides.
+//! - [`KimiCliBackend`] shells out to Moonshot's `kimi` CLI
+//!   (kimi-code). Same MCP context, delivered as a bind-mounted
+//!   `~/.kimi-code/mcp.json` since kimi has no config flag.
 //!
 //! Picking between them at runtime: see [`build_scan_backend`] and
 //! [`build_verifier_backend`].
 
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod kimi_cli;
 pub mod mcp;
 pub mod prompts;
 
@@ -32,6 +36,7 @@ use anyhow::Result;
 use clap::ValueEnum;
 pub use claude_cli::ClaudeCliBackend;
 pub use codex_cli::CodexCliBackend;
+pub use kimi_cli::KimiCliBackend;
 pub use mcp::{McpContext, McpTlsSource};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -49,6 +54,7 @@ pub enum JobAgent {
 	Auto,
 	Claude,
 	Codex,
+	Kimi,
 }
 
 impl JobAgent {
@@ -57,6 +63,7 @@ impl JobAgent {
 			Self::Auto => "auto",
 			Self::Claude => "claude",
 			Self::Codex => "codex",
+			Self::Kimi => "kimi",
 		}
 	}
 }
@@ -282,6 +289,39 @@ pub(crate) fn codex_api_key_env() -> Option<OsString> {
 	env_value("CODEX_API_KEY").or_else(|| env_value("OPENAI_API_KEY"))
 }
 
+/// Probe PATH for `kimi --version`. Returns `true` only if the
+/// invocation succeeds — a missing binary, non-zero exit, or any IO
+/// error all read as "not available."
+pub fn kimi_available() -> bool {
+	std::process::Command::new("kimi")
+		.arg("--version")
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status()
+		.map(|s| s.success())
+		.unwrap_or(false)
+}
+
+/// Host directory whose `config.toml` gets bind-mounted into the
+/// sandbox for the kimi backend. `KIMI_CODE_HOME` is loupe's own
+/// override (kimi itself has no home-dir env var; it always reads
+/// `~/.kimi-code`, which inside the sandbox is where the bind lands);
+/// otherwise the operator's `~/.kimi-code`.
+pub fn kimi_home_dir() -> Option<PathBuf> {
+	if let Some(home) = std::env::var_os("KIMI_CODE_HOME").filter(|v| !v.is_empty()) {
+		return Some(PathBuf::from(home));
+	}
+	home_path(".kimi-code")
+}
+
+/// Return true when the worker has material the kimi CLI can use
+/// without an interactive login: an `OPENAI_API_KEY` for env-based
+/// provider auth, or a `config.toml` (which may carry its own
+/// credentials) to bind-mount.
+pub fn kimi_auth_available() -> bool {
+	env_present("OPENAI_API_KEY") || kimi_home_dir().is_some_and(|p| p.join("config.toml").exists())
+}
+
 fn env_present(name: &str) -> bool {
 	env_value(name).is_some()
 }
@@ -301,6 +341,10 @@ fn home_path(child: &str) -> Option<PathBuf> {
 pub struct ReadyAgents {
 	pub claude: Option<CliModelConfig>,
 	pub codex: Option<CliModelConfig>,
+	/// kimi carries only a model alias: kimi-code has no effort
+	/// control, and provider/model resolution lives in its own
+	/// `config.toml`.
+	pub kimi: Option<String>,
 }
 
 /// Build the scan [`LlmBackend`] according to the configured agent
@@ -346,6 +390,11 @@ pub fn build_scan_backend(
 				"scan backend: codex (configured)"
 			);
 			Ok(Some(build_codex_backend(mcp, codex_agent, log_agent_output)))
+		},
+		JobAgent::Kimi => {
+			let model = require_agent_ready("scan", JobAgent::Kimi, &agents.kimi)?;
+			tracing::info!(model = %model, "scan backend: kimi (configured)");
+			Ok(Some(build_kimi_backend(mcp, model, log_agent_output)))
 		},
 	}
 }
@@ -405,6 +454,11 @@ pub fn build_verifier_backend(
 			);
 			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
 		},
+		JobAgent::Kimi => {
+			let model = require_agent_ready("verify", JobAgent::Kimi, &agents.kimi)?;
+			tracing::info!(model = %model, "verifier backend: kimi (configured)");
+			Ok(build_kimi_backend(mcp, model, log_agent_output))
+		},
 	}
 }
 
@@ -433,6 +487,17 @@ fn build_codex_backend(
 ) -> Arc<dyn LlmBackend> {
 	let mut backend =
 		CodexCliBackend::new().with_agent_config(agent).with_log_agent_output(log_agent_output);
+	if let Some(ctx) = mcp {
+		backend = backend.with_mcp_context(ctx);
+	}
+	Arc::new(backend)
+}
+
+fn build_kimi_backend(
+	mcp: Option<McpContext>, model: String, log_agent_output: bool,
+) -> Arc<dyn LlmBackend> {
+	let mut backend =
+		KimiCliBackend::new().with_model(model).with_log_agent_output(log_agent_output);
 	if let Some(ctx) = mcp {
 		backend = backend.with_mcp_context(ctx);
 	}
@@ -534,6 +599,7 @@ mod tests {
 		ReadyAgents {
 			claude: Some(CliModelConfig { model: "claude-test".into(), effort: "max".into() }),
 			codex: Some(CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() }),
+			kimi: Some("kimi-test".into()),
 		}
 	}
 
@@ -568,6 +634,21 @@ mod tests {
 	}
 
 	#[test]
+	fn scan_backend_allows_explicit_kimi_and_fails_when_unavailable() {
+		let backend = build_scan_backend(None, JobAgent::Kimi, &all_ready(), false)
+			.unwrap()
+			.expect("explicit kimi scan should register when kimi is ready");
+		assert_eq!(backend.id(), "kimi-cli");
+
+		let agents = ReadyAgents { kimi: None, ..all_ready() };
+		let err = match build_scan_backend(None, JobAgent::Kimi, &agents, false) {
+			Ok(_) => panic!("explicit unavailable kimi scan should fail"),
+			Err(e) => e,
+		};
+		assert!(err.to_string().contains("scan agent `kimi`"), "got: {err}");
+	}
+
+	#[test]
 	fn verifier_backend_auto_prefers_codex_then_claude() {
 		let backend = build_verifier_backend(None, JobAgent::Auto, &all_ready(), false).unwrap();
 		assert_eq!(backend.id(), "codex-cli");
@@ -576,7 +657,9 @@ mod tests {
 		let backend = build_verifier_backend(None, JobAgent::Auto, &agents, false).unwrap();
 		assert_eq!(backend.id(), "claude-cli");
 
-		let agents = ReadyAgents { claude: None, codex: None };
+		// kimi is never picked by auto, even when it is the only agent
+		// ready: only explicit selection routes jobs to it.
+		let agents = ReadyAgents { claude: None, codex: None, ..all_ready() };
 		let err = match build_verifier_backend(None, JobAgent::Auto, &agents, false) {
 			Ok(_) => panic!("missing verifier backend should be rejected"),
 			Err(e) => e,
@@ -588,6 +671,9 @@ mod tests {
 	fn verifier_backend_honors_explicit_selection() {
 		let backend = build_verifier_backend(None, JobAgent::Claude, &all_ready(), false).unwrap();
 		assert_eq!(backend.id(), "claude-cli");
+
+		let backend = build_verifier_backend(None, JobAgent::Kimi, &all_ready(), false).unwrap();
+		assert_eq!(backend.id(), "kimi-cli");
 
 		let agents = ReadyAgents { claude: None, ..all_ready() };
 		let err = match build_verifier_backend(None, JobAgent::Claude, &agents, false) {

@@ -18,8 +18,8 @@ use clap::{Parser, Subcommand};
 use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
-	claude_available, codex_auth_available, codex_available, JobAgent, McpContext, McpTlsSource,
-	ReadyAgents,
+	claude_available, codex_auth_available, codex_available, kimi_auth_available, kimi_available,
+	JobAgent, McpContext, McpTlsSource, ReadyAgents,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -102,10 +102,10 @@ struct RunArgs {
 	/// Dump full successful agent stdout/stderr at info level.
 	#[arg(long, env = "LOUPE_LOG_AGENT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
 	log_agent_output: Option<bool>,
-	/// Agent backend for LLM scan jobs: auto, claude, or codex.
+	/// Agent backend for LLM scan jobs: auto, claude, codex, or kimi.
 	#[arg(long, env = "LOUPE_SCAN_AGENT", value_enum)]
 	scan_agent: Option<JobAgent>,
-	/// Agent backend for LLM verify jobs: auto, claude, or codex.
+	/// Agent backend for LLM verify jobs: auto, claude, codex, or kimi.
 	#[arg(long, env = "LOUPE_VERIFY_AGENT", value_enum)]
 	verify_agent: Option<JobAgent>,
 	/// Claude model for every Claude-backed invocation.
@@ -120,6 +120,10 @@ struct RunArgs {
 	/// Codex reasoning effort: none, low, medium, high, or xhigh.
 	#[arg(long, env = "LOUPE_CODEX_EFFORT")]
 	codex_effort: Option<String>,
+	/// Kimi model alias for every kimi-backed invocation. Must match
+	/// a model alias defined in the kimi config.toml.
+	#[arg(long, env = "LOUPE_KIMI_MODEL")]
+	kimi_model: Option<String>,
 	/// Fleet-wide default for concurrent per-file LLM sessions.
 	#[arg(long, env = "LOUPE_MAX_CONCURRENT_FILES")]
 	max_concurrent_files: Option<usize>,
@@ -245,27 +249,34 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	//   default: use claude when ready, otherwise advertise verify-only.
 	// - [agents].verify = "auto" preserves the historical verifier
 	//   default: prefer codex, falling back to claude.
-	// - explicit claude/codex selections fail startup when unavailable.
+	// - explicit claude/codex/kimi selections fail startup when
+	//   unavailable.
 	// - no authenticated CLI still hard-fatals at startup. Docker
-	//   images can install both CLIs, but missing API keys should fail
+	//   images can install the CLIs, but missing API keys should fail
 	//   before a worker leases jobs.
 	let claude_installed = claude_available();
 	let codex_installed = codex_available();
+	let kimi_installed = kimi_available();
 	let claude_auth = claude_auth_available();
 	let codex_auth = codex_auth_available();
+	let kimi_auth = kimi_auth_available();
 	let ready = ReadyAgents {
 		claude: (claude_installed && claude_auth).then(|| cfg.agents.claude.clone()),
 		codex: (codex_installed && codex_auth).then(|| cfg.agents.codex.clone()),
+		kimi: (kimi_installed && kimi_auth).then(|| cfg.agents.kimi_model.clone()),
 	};
-	if ready.claude.is_none() && ready.codex.is_none() {
+	if ready.claude.is_none() && ready.codex.is_none() && ready.kimi.is_none() {
 		anyhow::bail!(
 			"no authenticated LLM agent CLI available \
-			 (claude: installed={}, auth={}; codex: installed={}, auth={}). \
+			 (claude: installed={}, auth={}; codex: installed={}, auth={}; \
+			 kimi: installed={}, auth={}). \
 			 Install at least one CLI and provide its API key before starting the worker.",
 			claude_installed,
 			claude_auth,
 			codex_installed,
 			codex_auth,
+			kimi_installed,
+			kimi_auth,
 		);
 	}
 	if claude_installed && !claude_auth {
@@ -277,6 +288,9 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 		tracing::warn!(
 			"`codex` is installed but no CODEX_API_KEY, OPENAI_API_KEY, or codex auth.json was found"
 		);
+	}
+	if kimi_installed && !kimi_auth {
+		tracing::warn!("`kimi` is installed but no OPENAI_API_KEY or kimi config.toml was found");
 	}
 	// bwrap is the security boundary for every agent subprocess; if
 	// it's missing and LOUPE_DISABLE_SANDBOX isn't set, refuse to run.
@@ -421,6 +435,7 @@ fn load_worker_config(args: &RunArgs) -> Result<WorkerConfig> {
 			claude_effort: args.claude_effort.clone(),
 			codex_model: args.codex_model.clone(),
 			codex_effort: args.codex_effort.clone(),
+			kimi_model: args.kimi_model.clone(),
 			max_concurrent_files: args.max_concurrent_files,
 			max_file_bytes: args.max_file_bytes,
 			per_request_timeout_seconds: args.per_request_timeout_seconds,

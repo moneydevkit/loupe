@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::llm::claude_cli::{DEFAULT_CLAUDE_EFFORT, DEFAULT_CLAUDE_MODEL};
 use crate::llm::codex_cli::{DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL};
+use crate::llm::kimi_cli::DEFAULT_KIMI_MODEL;
 use crate::llm::mcp::DEFAULT_BKB_API_URL;
 use crate::llm::{CliModelConfig, JobAgent, DEFAULT_REQUEST_TIMEOUT};
 use crate::runner::DEFAULT_MAX_WORKDIR_BYTES;
@@ -61,6 +62,10 @@ pub struct AgentsConfig {
 	pub verify: JobAgent,
 	pub claude: CliModelConfig,
 	pub codex: CliModelConfig,
+	/// kimi-code takes only a model alias (resolved by its own
+	/// `config.toml`); it exposes no effort control, so none exists
+	/// here.
+	pub kimi_model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +92,7 @@ pub struct WorkerConfigOverrides {
 	pub claude_effort: Option<String>,
 	pub codex_model: Option<String>,
 	pub codex_effort: Option<String>,
+	pub kimi_model: Option<String>,
 	pub max_concurrent_files: Option<usize>,
 	pub max_file_bytes: Option<u64>,
 	pub per_request_timeout_seconds: Option<u64>,
@@ -172,6 +178,18 @@ pub struct AgentsSection {
 	pub claude: AgentSection,
 	#[serde(default)]
 	pub codex: AgentSection,
+	#[serde(default)]
+	pub kimi: KimiAgentSection,
+}
+
+/// kimi-code has no effort control, so its section deliberately
+/// cannot express one — `deny_unknown_fields` rejects the attempt
+/// instead of silently ignoring it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KimiAgentSection {
+	#[serde(default)]
+	pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -266,6 +284,9 @@ impl WorkerConfig {
 		if let Some(v) = file.agents.codex.effort {
 			self.agents.codex.effort = v;
 		}
+		if let Some(v) = file.agents.kimi.model {
+			self.agents.kimi_model = v;
+		}
 		if let Some(v) = file.scanner_defaults.max_concurrent_files {
 			self.scanner_defaults.max_concurrent_files = v;
 		}
@@ -333,6 +354,9 @@ impl WorkerConfig {
 		if let Some(v) = overrides.codex_effort {
 			self.agents.codex.effort = v;
 		}
+		if let Some(v) = overrides.kimi_model {
+			self.agents.kimi_model = v;
+		}
 		if let Some(v) = overrides.max_concurrent_files {
 			self.scanner_defaults.max_concurrent_files = v;
 		}
@@ -350,6 +374,7 @@ impl WorkerConfig {
 	fn validate(&self) -> Result<()> {
 		validate_nonempty("agents.claude.model", &self.agents.claude.model)?;
 		validate_nonempty("agents.codex.model", &self.agents.codex.model)?;
+		validate_nonempty("agents.kimi.model", &self.agents.kimi_model)?;
 		validate_effort(
 			"agents.claude.effort",
 			&self.agents.claude.effort,
@@ -411,6 +436,7 @@ impl Default for WorkerConfig {
 					model: DEFAULT_CODEX_MODEL.to_owned(),
 					effort: DEFAULT_CODEX_EFFORT.to_owned(),
 				},
+				kimi_model: DEFAULT_KIMI_MODEL.to_owned(),
 			},
 			scanner_defaults: LlmScannerConfig {
 				max_concurrent_files: DEFAULT_MAX_CONCURRENT_FILES,
@@ -533,6 +559,9 @@ effort = "xhigh"
 model = "gpt-custom"
 effort = "high"
 
+[agents.kimi]
+model = "kimi-custom"
+
 [scanner_defaults]
 max_concurrent_files = 2
 max_file_bytes = 1234
@@ -563,6 +592,7 @@ api_url = "https://bkb.example.test"
 		assert_eq!(cfg.agents.claude.effort, "xhigh");
 		assert_eq!(cfg.agents.codex.model, "gpt-custom");
 		assert_eq!(cfg.agents.codex.effort, "high");
+		assert_eq!(cfg.agents.kimi_model, "kimi-custom");
 		assert_eq!(cfg.scanner_defaults.max_concurrent_files, 2);
 		assert_eq!(cfg.scanner_defaults.max_file_bytes, 1234);
 		assert_eq!(cfg.scanner_defaults.per_request_timeout, Duration::from_secs(99));
