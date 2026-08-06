@@ -134,6 +134,8 @@
             jq
             # Edits deploy/secrets.yaml; see deploy/.sops.yaml.
             sops
+            # Deploy / local-VM operations; see ./justfile.
+            just
           ];
 
           # loupe's bwrap sandbox can't nest the isolate-wrapped agent
