@@ -77,6 +77,10 @@
         packages = {
           default = loupe;
           inherit loupe;
+        }
+        # Binary release, linux-x64 only.
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          kimi-code = pkgs.callPackage ./nix/kimi-code.nix { };
         };
 
         checks = {
