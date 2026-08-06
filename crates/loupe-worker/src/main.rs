@@ -19,6 +19,7 @@ use loupe_worker::config::{LoggingConfig, WorkerConfig, WorkerConfigOverrides};
 use loupe_worker::llm::{
 	bkb_mcp_available, build_scan_backend, build_verifier_backend, claude_auth_available,
 	claude_available, codex_auth_available, codex_available, JobAgent, McpContext, McpTlsSource,
+	ReadyAgents,
 };
 use loupe_worker::scanners::{LlmCodeReviewScanner, LlmVerifierScanner, RegexSecretsScanner};
 use loupe_worker::{mcp, sandbox, RepoCache, Runner, Scanner, ServerClient};
@@ -252,9 +253,11 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	let codex_installed = codex_available();
 	let claude_auth = claude_auth_available();
 	let codex_auth = codex_auth_available();
-	let claude = claude_installed && claude_auth;
-	let codex = codex_installed && codex_auth;
-	if !claude && !codex {
+	let ready = ReadyAgents {
+		claude: (claude_installed && claude_auth).then(|| cfg.agents.claude.clone()),
+		codex: (codex_installed && codex_auth).then(|| cfg.agents.codex.clone()),
+	};
+	if ready.claude.is_none() && ready.codex.is_none() {
 		anyhow::bail!(
 			"no authenticated LLM agent CLI available \
 			 (claude: installed={}, auth={}; codex: installed={}, auth={}). \
@@ -326,10 +329,7 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	if let Some(backend) = build_scan_backend(
 		Some(mcp_ctx.clone()),
 		cfg.agents.scan,
-		claude,
-		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
+		&ready,
 		cfg.logging.agent_output,
 	)? {
 		scanners.push(Arc::new(
@@ -344,15 +344,8 @@ async fn run_worker(args: RunArgs, cfg: WorkerConfig) -> Result<()> {
 	// for the verify-mode tool surface (`submit_verdict` /
 	// `submit_patch` / `validate_patch`); without it, the agent has
 	// no way to commit a verdict.
-	let backend = build_verifier_backend(
-		Some(mcp_ctx),
-		cfg.agents.verify,
-		claude,
-		codex,
-		cfg.agents.codex.clone(),
-		cfg.agents.claude.clone(),
-		cfg.logging.agent_output,
-	)?;
+	let backend =
+		build_verifier_backend(Some(mcp_ctx), cfg.agents.verify, &ready, cfg.logging.agent_output)?;
 	scanners.push(Arc::new(LlmVerifierScanner::new(backend)));
 	tracing::info!("LLM verifier scanner enabled (verify:llm advertised, MCP-driven)");
 

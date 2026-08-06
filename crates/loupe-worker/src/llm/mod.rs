@@ -294,31 +294,43 @@ fn home_path(child: &str) -> Option<PathBuf> {
 	std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(child))
 }
 
+/// The agents this worker can actually run: installed, authenticated,
+/// and configured. `Some(config)` means ready — readiness and config
+/// travel together so "ready but unconfigured" cannot be represented.
+#[derive(Debug, Clone, Default)]
+pub struct ReadyAgents {
+	pub claude: Option<CliModelConfig>,
+	pub codex: Option<CliModelConfig>,
+}
+
 /// Build the scan [`LlmBackend`] according to the configured agent
 /// selection. `auto` preserves the historical behaviour: Claude owns
-/// LLM discovery when ready; Codex-only workers advertise verify-only
-/// unless the operator explicitly selects Codex for scan jobs.
+/// LLM discovery when ready; workers without Claude advertise
+/// verify-only unless the operator explicitly selects another agent
+/// for scan jobs.
 pub fn build_scan_backend(
-	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
-	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
+	mcp: Option<McpContext>, selection: JobAgent, agents: &ReadyAgents, log_agent_output: bool,
 ) -> Result<Option<Arc<dyn LlmBackend>>> {
 	match selection {
-		JobAgent::Auto if claude_ready => {
-			tracing::info!(
-				model = %claude_agent.model,
-				effort = %claude_agent.effort,
-				"scan backend: claude (auto)"
-			);
-			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
-		},
-		JobAgent::Auto => {
-			tracing::info!(
-				"`claude` not ready and scan agent is auto; LLM code-review scanner not registered"
-			);
-			Ok(None)
+		JobAgent::Auto => match &agents.claude {
+			Some(claude_agent) => {
+				tracing::info!(
+					model = %claude_agent.model,
+					effort = %claude_agent.effort,
+					"scan backend: claude (auto)"
+				);
+				Ok(Some(build_claude_backend(mcp, claude_agent.clone(), log_agent_output)))
+			},
+			None => {
+				tracing::info!(
+					"`claude` not ready and scan agent is auto; LLM code-review scanner not \
+					 registered"
+				);
+				Ok(None)
+			},
 		},
 		JobAgent::Claude => {
-			require_agent_ready("scan", JobAgent::Claude, claude_ready)?;
+			let claude_agent = require_agent_ready("scan", JobAgent::Claude, &agents.claude)?;
 			tracing::info!(
 				model = %claude_agent.model,
 				effort = %claude_agent.effort,
@@ -327,7 +339,7 @@ pub fn build_scan_backend(
 			Ok(Some(build_claude_backend(mcp, claude_agent, log_agent_output)))
 		},
 		JobAgent::Codex => {
-			require_agent_ready("scan", JobAgent::Codex, codex_ready)?;
+			let codex_agent = require_agent_ready("scan", JobAgent::Codex, &agents.codex)?;
 			tracing::info!(
 				model = %codex_agent.model,
 				effort = %codex_agent.effort,
@@ -353,29 +365,30 @@ pub fn build_scan_backend(
 /// Logs the choice at info level so operators can see which backend
 /// is actually verifying without having to inspect process listings.
 pub fn build_verifier_backend(
-	mcp: Option<McpContext>, selection: JobAgent, claude_ready: bool, codex_ready: bool,
-	codex_agent: CliModelConfig, claude_agent: CliModelConfig, log_agent_output: bool,
+	mcp: Option<McpContext>, selection: JobAgent, agents: &ReadyAgents, log_agent_output: bool,
 ) -> Result<Arc<dyn LlmBackend>> {
 	match selection {
-		JobAgent::Auto if codex_ready => {
-			tracing::info!(
-				model = %codex_agent.model,
-				effort = %codex_agent.effort,
-				"verifier backend: codex (auto)"
-			);
-			Ok(build_codex_backend(mcp, codex_agent, log_agent_output))
+		JobAgent::Auto => {
+			if let Some(codex_agent) = &agents.codex {
+				tracing::info!(
+					model = %codex_agent.model,
+					effort = %codex_agent.effort,
+					"verifier backend: codex (auto)"
+				);
+				return Ok(build_codex_backend(mcp, codex_agent.clone(), log_agent_output));
+			}
+			if let Some(claude_agent) = &agents.claude {
+				tracing::info!(
+					model = %claude_agent.model,
+					effort = %claude_agent.effort,
+					"verifier backend: claude (auto, codex unavailable)"
+				);
+				return Ok(build_claude_backend(mcp, claude_agent.clone(), log_agent_output));
+			}
+			anyhow::bail!("no authenticated verifier backend available")
 		},
-		JobAgent::Auto if claude_ready => {
-			tracing::info!(
-				model = %claude_agent.model,
-				effort = %claude_agent.effort,
-				"verifier backend: claude (auto, codex unavailable)"
-			);
-			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
-		},
-		JobAgent::Auto => anyhow::bail!("no authenticated verifier backend available"),
 		JobAgent::Claude => {
-			require_agent_ready("verify", JobAgent::Claude, claude_ready)?;
+			let claude_agent = require_agent_ready("verify", JobAgent::Claude, &agents.claude)?;
 			tracing::info!(
 				model = %claude_agent.model,
 				effort = %claude_agent.effort,
@@ -384,7 +397,7 @@ pub fn build_verifier_backend(
 			Ok(build_claude_backend(mcp, claude_agent, log_agent_output))
 		},
 		JobAgent::Codex => {
-			require_agent_ready("verify", JobAgent::Codex, codex_ready)?;
+			let codex_agent = require_agent_ready("verify", JobAgent::Codex, &agents.codex)?;
 			tracing::info!(
 				model = %codex_agent.model,
 				effort = %codex_agent.effort,
@@ -395,14 +408,13 @@ pub fn build_verifier_backend(
 	}
 }
 
-fn require_agent_ready(job_kind: &str, agent: JobAgent, ready: bool) -> Result<()> {
-	if !ready {
-		anyhow::bail!(
+fn require_agent_ready<T: Clone>(job_kind: &str, agent: JobAgent, ready: &Option<T>) -> Result<T> {
+	ready.clone().ok_or_else(|| {
+		anyhow::anyhow!(
 			"{job_kind} agent `{agent}` was explicitly selected but that CLI is not installed \
 			 or not authenticated"
-		);
-	}
-	Ok(())
+		)
+	})
 }
 
 fn build_claude_backend(
@@ -518,53 +530,37 @@ mod tests {
 		assert!(codex_auth_available());
 	}
 
+	fn all_ready() -> ReadyAgents {
+		ReadyAgents {
+			claude: Some(CliModelConfig { model: "claude-test".into(), effort: "max".into() }),
+			codex: Some(CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() }),
+		}
+	}
+
 	#[test]
 	fn scan_backend_auto_preserves_claude_only_discovery_default() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
-
-		let backend = build_scan_backend(
-			None,
-			JobAgent::Auto,
-			true,
-			true,
-			codex.clone(),
-			claude.clone(),
-			false,
-		)
-		.unwrap()
-		.expect("claude-ready auto scan should register");
+		let backend = build_scan_backend(None, JobAgent::Auto, &all_ready(), false)
+			.unwrap()
+			.expect("claude-ready auto scan should register");
 		assert_eq!(backend.id(), "claude-cli");
 
-		let backend =
-			build_scan_backend(None, JobAgent::Auto, false, true, codex.clone(), claude, false)
-				.unwrap();
+		let agents = ReadyAgents { claude: None, ..all_ready() };
+		let backend = build_scan_backend(None, JobAgent::Auto, &agents, false).unwrap();
 		assert!(
 			backend.is_none(),
-			"auto scan should not switch to codex unless explicitly configured"
+			"auto scan should not switch to another agent unless explicitly configured"
 		);
 	}
 
 	#[test]
 	fn scan_backend_allows_explicit_codex_and_fails_when_unavailable() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
-
-		let backend = build_scan_backend(
-			None,
-			JobAgent::Codex,
-			true,
-			true,
-			codex.clone(),
-			claude.clone(),
-			false,
-		)
-		.unwrap()
-		.expect("explicit codex scan should register when codex is ready");
+		let backend = build_scan_backend(None, JobAgent::Codex, &all_ready(), false)
+			.unwrap()
+			.expect("explicit codex scan should register when codex is ready");
 		assert_eq!(backend.id(), "codex-cli");
 
-		let err = match build_scan_backend(None, JobAgent::Codex, true, false, codex, claude, false)
-		{
+		let agents = ReadyAgents { codex: None, ..all_ready() };
+		let err = match build_scan_backend(None, JobAgent::Codex, &agents, false) {
 			Ok(_) => panic!("explicit unavailable codex scan should fail"),
 			Err(e) => e,
 		};
@@ -573,41 +569,15 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_auto_prefers_codex_then_claude() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
-		let backend = build_verifier_backend(
-			None,
-			JobAgent::Auto,
-			true,
-			true,
-			codex.clone(),
-			claude.clone(),
-			false,
-		)
-		.unwrap();
+		let backend = build_verifier_backend(None, JobAgent::Auto, &all_ready(), false).unwrap();
 		assert_eq!(backend.id(), "codex-cli");
 
-		let backend = build_verifier_backend(
-			None,
-			JobAgent::Auto,
-			true,
-			false,
-			codex.clone(),
-			claude.clone(),
-			false,
-		)
-		.unwrap();
+		let agents = ReadyAgents { codex: None, ..all_ready() };
+		let backend = build_verifier_backend(None, JobAgent::Auto, &agents, false).unwrap();
 		assert_eq!(backend.id(), "claude-cli");
 
-		let err = match build_verifier_backend(
-			None,
-			JobAgent::Auto,
-			false,
-			false,
-			codex,
-			claude,
-			false,
-		) {
+		let agents = ReadyAgents { claude: None, codex: None };
+		let err = match build_verifier_backend(None, JobAgent::Auto, &agents, false) {
 			Ok(_) => panic!("missing verifier backend should be rejected"),
 			Err(e) => e,
 		};
@@ -616,27 +586,14 @@ mod tests {
 
 	#[test]
 	fn verifier_backend_honors_explicit_selection() {
-		let codex = CliModelConfig { model: "gpt-test".into(), effort: "xhigh".into() };
-		let claude = CliModelConfig { model: "claude-test".into(), effort: "max".into() };
-
-		let backend = build_verifier_backend(
-			None,
-			JobAgent::Claude,
-			true,
-			true,
-			codex.clone(),
-			claude.clone(),
-			false,
-		)
-		.unwrap();
+		let backend = build_verifier_backend(None, JobAgent::Claude, &all_ready(), false).unwrap();
 		assert_eq!(backend.id(), "claude-cli");
 
-		let err =
-			match build_verifier_backend(None, JobAgent::Claude, false, true, codex, claude, false)
-			{
-				Ok(_) => panic!("explicit unavailable claude verifier should fail"),
-				Err(e) => e,
-			};
+		let agents = ReadyAgents { claude: None, ..all_ready() };
+		let err = match build_verifier_backend(None, JobAgent::Claude, &agents, false) {
+			Ok(_) => panic!("explicit unavailable claude verifier should fail"),
+			Err(e) => e,
+		};
 		assert!(err.to_string().contains("verify agent `claude`"), "got: {err}");
 	}
 }
