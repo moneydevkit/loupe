@@ -78,13 +78,36 @@ Then, from this directory:
 - Rotate a clone PAT: `loupectl repo set-clone-pat <id> --pat ...`
   (or `--clear`).
 
-## VM smoke test
+## Local VM deployment
+
+The same system runs as a QEMU VM on any machine with KVM — identical
+config, real secrets, persistent state. Useful both as the actual
+deployment (a beefy local box instead of rented hardware) and for
+development.
 
 ```
 nix build ./deploy && ./result/bin/run-loupe-vm
 ```
 
-Builds the same system as a QEMU VM with dummy secrets (nothing in the
-VM can decrypt `secrets.yaml`). Good for checking that units render and
-the system boots; the units still crash-loop until a bootstrap runs
-inside, exactly like a fresh box.
+The root disk persists as `./loupe.qcow2` in the launch directory, so
+`/var/lib/loupe-*` survives restarts like a physical machine; delete
+the file to factory-reset. SSH is forwarded on port 2223.
+
+First boot follows the physical-box flow, with the VM's own host key:
+
+```
+ssh -p 2223 root@localhost cat /etc/ssh/ssh_host_ed25519_key.pub \
+  | nix run nixpkgs#ssh-to-age
+# add to .sops.yaml, then: sops updatekeys secrets.yaml
+nix build ./deploy && ./result/bin/run-loupe-vm   # rebuild, restart
+ssh -p 2223 root@localhost sudo loupe-bootstrap
+```
+
+Redeploy after config or loupe changes: rebuild and restart the VM.
+The guest mounts the host's /nix/store over 9p, so rebuilds are
+incremental. Resources (16G RAM, 8 cores, 64G disk) are set in
+`configuration.nix` under `virtualisation.vmVariant`.
+
+Until the host key is admitted, sops decryption fails at activation
+and the loupe units crash-loop — the pre-bootstrap state of any fresh
+box — which is also all you need for a units-render smoke test.

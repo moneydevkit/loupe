@@ -10,7 +10,6 @@
 # certs and register the worker.
 {
   config,
-  lib,
   pkgs,
   loupe,
   ...
@@ -71,7 +70,7 @@ in
 
   services.openssh.enable = true;
   users.users.root.openssh.authorizedKeys.keys = [
-    # FIXME: operator SSH public key(s) before the first deploy.
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKj473/+eAlgy1rQwuO+nCRrqhiPAWEgYPIn5j/NdN1Q"
   ];
 
   sops.defaultSopsFile = ./secrets.yaml;
@@ -130,17 +129,33 @@ in
     CODEX_HOME = "${codexHome}";
   };
 
-  # `nix build ./deploy` smoke build. The VM has no key that can decrypt
-  # secrets.yaml, so the two consumers get dummies; sops decryption fails
-  # loudly at activation, which is harmless here. Units crash-loop until
-  # the in-VM bootstrap runs, same as a fresh box.
-  virtualisation.vmVariant = {
-    virtualisation.graphics = false;
-    services.loupe.server.masterKeyFile = lib.mkForce (
-      pkgs.writeText "dummy-master.key" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    );
-    services.loupe.worker.environmentFile = lib.mkForce (
-      pkgs.writeText "dummy-agent.env" "OPENAI_API_KEY=dummy"
-    );
+  # `nix build ./deploy` local VM: the same system, deployable on any
+  # machine with KVM. Root disk (./loupe.qcow2) persists across runs, so
+  # state survives like a physical box; the host /nix/store is mounted
+  # over 9p, so a redeploy is rebuild + restart. Secrets are the real
+  # sops path: admit the VM's generated host key exactly like a physical
+  # box's (see README), before which units crash-loop, same as any
+  # fresh machine.
+  virtualisation.vmVariant.virtualisation = {
+    memorySize = 16384;
+    cores = 8;
+    diskSize = 65536;
+    diskImage = "./loupe.qcow2";
+    graphics = false;
+    # Without ballooning, qemu's footprint is a high-water mark: guest
+    # pages fault in on demand and nothing ever returns them to the
+    # host. Idle vCPUs need no equivalent; KVM halts them.
+    qemu.options = [ "-device virtio-balloon,free-page-reporting=on" ];
+    # The default writable-store overlay is a tmpfs sized at half of
+    # RAM; put store writes on disk instead.
+    writableStoreUseTmpfs = false;
+    # 2223 because other local VMs already claim 2222.
+    forwardPorts = [
+      {
+        from = "host";
+        host.port = 2223;
+        guest.port = 22;
+      }
+    ];
   };
 }

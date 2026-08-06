@@ -30,3 +30,9 @@ Cargo.lock.bak
 *.swp
 *.swo
 .DS_Store
+
+# direnv
+.direnv/
+
+# local VM root disk (deploy/README.md)
+loupe.qcow2
