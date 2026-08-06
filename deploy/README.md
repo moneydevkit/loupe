@@ -62,13 +62,26 @@ Then, from this directory:
    loupectl repo scan 1
    ```
 
-   For a private repo, pass a clone credential — a fine-grained PAT
-   with read-only Contents scope on just that repo:
+   For a private repo, pass a clone credential (a fine-grained PAT
+   with read-only Contents scope on just that repo):
 
    ```
    LOUPE_CLONE_PAT=github_pat_... loupectl repo add \
      --clone-url https://github.com/<owner>/<repo> --no-reporting
    ```
+
+   For a monorepo, scope the scan to one or more subtrees with
+   `--include-path` (repeatable, matched by whole path component).
+   Everything outside them is skipped, which keeps the per-file LLM
+   fan-out off packages you don't care about:
+
+   ```
+   loupectl repo add --clone-url https://github.com/<owner>/<repo> \
+     --no-reporting --include-path app/api --include-path app/lib
+   ```
+
+   Path scoping is register-time only; to change it, re-register the
+   repo (`loupectl repo rm <id>` then add again).
 
 ## Day 2
 

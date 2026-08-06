@@ -34,6 +34,13 @@ pub struct ScannerConfig {
 	/// output directories. Legacy custom strings still match as path
 	/// substrings, except `/name` matches an exact component.
 	pub exclude_path_substrings: Vec<String>,
+	/// Worktree-relative path prefixes to restrict the scan to. Empty
+	/// means the whole worktree; non-empty keeps only files under one of
+	/// the prefixes (e.g. `["app/api", "app/lib"]` to scope a monorepo
+	/// to its server code). Applied on top of the extension allowlist
+	/// and excludes, so a prefix never re-includes a test or non-source
+	/// file.
+	pub include_path_prefixes: Vec<String>,
 }
 
 impl Default for ScannerConfig {
@@ -44,6 +51,7 @@ impl Default for ScannerConfig {
 			per_request_timeout: DEFAULT_REQUEST_TIMEOUT,
 			include_extensions: default_extensions(),
 			exclude_path_substrings: default_excludes(),
+			include_path_prefixes: Vec::new(),
 		}
 	}
 }
@@ -66,6 +74,7 @@ pub struct ScannerConfigPatch {
 	pub per_request_timeout_seconds: Option<u64>,
 	pub include_extensions: Option<Vec<String>>,
 	pub exclude_path_substrings: Option<Vec<String>>,
+	pub include_path_prefixes: Option<Vec<String>>,
 }
 
 impl ScannerConfig {
@@ -84,6 +93,9 @@ impl ScannerConfig {
 		}
 		if let Some(v) = p.exclude_path_substrings {
 			self.exclude_path_substrings = v;
+		}
+		if let Some(v) = p.include_path_prefixes {
+			self.include_path_prefixes = v;
 		}
 	}
 }
@@ -175,6 +187,14 @@ pub(crate) fn walk_source_files(workdir: &Path, cfg: &ScannerConfig) -> Vec<Path
 		for root in roots.roots {
 			collect_from_root(&root, cfg, &mut out);
 		}
+	}
+
+	if !cfg.include_path_prefixes.is_empty() {
+		out.retain(|path| {
+			path.strip_prefix(workdir)
+				.map(|rel| cfg.include_path_prefixes.iter().any(|p| rel.starts_with(p)))
+				.unwrap_or(false)
+		});
 	}
 
 	out.sort();
@@ -539,6 +559,52 @@ mod tests {
 		cfg.apply_patch(patch);
 		assert_eq!(cfg.include_extensions, vec!["c".to_owned(), "h".to_owned()]);
 		assert_eq!(cfg.exclude_path_substrings, original_excludes);
+	}
+
+	#[test]
+	fn include_path_prefixes_scope_the_walk_to_subtrees() {
+		let tmp = tempfile::tempdir().unwrap();
+		for f in ["app/api/route.ts", "app/lib/db.ts", "app/components/ui.tsx", "scripts/x.ts"] {
+			let p = tmp.path().join(f);
+			std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+			std::fs::write(p, "// stub\n").unwrap();
+		}
+		let cfg = ScannerConfig {
+			include_path_prefixes: vec!["app/api".into(), "app/lib".into()],
+			..ScannerConfig::default()
+		};
+		let mut names = rel_names(tmp.path(), walk_source_files(tmp.path(), &cfg));
+		names.sort();
+		assert_eq!(names, vec!["app/api/route.ts".to_owned(), "app/lib/db.ts".to_owned()]);
+	}
+
+	#[test]
+	fn include_path_prefixes_match_whole_components_not_string_prefix() {
+		let tmp = tempfile::tempdir().unwrap();
+		for f in ["app/api/route.ts", "app/apiv2/route.ts"] {
+			let p = tmp.path().join(f);
+			std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+			std::fs::write(p, "// stub\n").unwrap();
+		}
+		let cfg = ScannerConfig {
+			include_path_prefixes: vec!["app/api".into()],
+			..ScannerConfig::default()
+		};
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &cfg));
+		// `Path::starts_with` is component-wise, so `app/apiv2` is not caught.
+		assert_eq!(names, vec!["app/api/route.ts".to_owned()]);
+	}
+
+	#[test]
+	fn empty_include_path_prefixes_scan_the_whole_tree() {
+		let tmp = tempfile::tempdir().unwrap();
+		for f in ["app/api/route.ts", "scripts/x.ts"] {
+			let p = tmp.path().join(f);
+			std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+			std::fs::write(p, "// stub\n").unwrap();
+		}
+		let names = rel_names(tmp.path(), walk_source_files(tmp.path(), &ScannerConfig::default()));
+		assert_eq!(names.len(), 2, "default (empty prefixes) keeps all source: {names:?}");
 	}
 
 	#[test]

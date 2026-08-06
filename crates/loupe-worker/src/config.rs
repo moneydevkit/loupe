@@ -444,6 +444,7 @@ impl Default for WorkerConfig {
 				per_request_timeout: DEFAULT_REQUEST_TIMEOUT,
 				include_extensions: scanner_defaults.include_extensions,
 				exclude_path_substrings: scanner_defaults.exclude_path_substrings,
+				include_path_prefixes: scanner_defaults.include_path_prefixes,
 			},
 			bkb: BkbConfig { api_url: DEFAULT_BKB_API_URL.to_owned() },
 		}

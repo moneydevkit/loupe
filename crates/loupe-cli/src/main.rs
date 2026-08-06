@@ -198,6 +198,12 @@ struct RepoAddArgs {
 	/// Read from LOUPE_CLONE_PAT if omitted.
 	#[arg(long, env = "LOUPE_CLONE_PAT", hide_env_values = true)]
 	clone_pat: Option<String>,
+	/// Restrict the scan to files under this worktree-relative path
+	/// prefix, matched by whole path component (e.g. `app/api`). Repeat
+	/// to allow several subtrees. Omit to scan the whole worktree. Handy
+	/// for monorepos where only part of the tree is worth scanning.
+	#[arg(long = "include-path", value_name = "PREFIX")]
+	include_path: Vec<String>,
 	/// Skip configuring an automatic reporter. Findings still go
 	/// through the full scan + verification + approval pipeline.
 	/// Confirmed findings remain `confirmed` so operators can configure
@@ -569,6 +575,11 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 			github_pat: a.pat.expect("clap enforces pat"),
 		}
 	};
+	let scanner_config = if a.include_path.is_empty() {
+		serde_json::Value::Null
+	} else {
+		serde_json::json!({ "include_path_prefixes": a.include_path })
+	};
 	let req = RegisterRepoRequest {
 		protocol_version: PROTOCOL_VERSION,
 		clone_url: a.clone_url,
@@ -576,7 +587,7 @@ async fn repo_add(client: &reqwest::Client, base: &reqwest::Url, a: RepoAddArgs)
 		scan_interval_seconds: a.scan_interval_seconds,
 		reporting,
 		clone_pat: a.clone_pat,
-		scanner_config: serde_json::Value::Null,
+		scanner_config,
 		verification_enabled,
 		require_approval,
 	};
@@ -1164,6 +1175,29 @@ mod tests {
 		let neither =
 			Cli::try_parse_from(base.iter().copied().chain(["repo", "set-clone-pat", "7"]));
 		assert!(neither.is_err(), "one of --pat / --clear is required");
+	}
+
+	#[test]
+	fn repo_add_collects_repeatable_include_path() {
+		let cli = Cli::try_parse_from([
+			"loupectl",
+			"--server-url",
+			"https://loupe.example:8443",
+			"repo",
+			"add",
+			"--clone-url",
+			"https://github.com/acme/widget.git",
+			"--no-reporting",
+			"--include-path",
+			"app/api",
+			"--include-path",
+			"app/lib",
+		])
+		.unwrap();
+		let Cmd::Repo(RepoCmd::Add(args)) = cli.cmd else {
+			panic!("expected repo add command");
+		};
+		assert_eq!(args.include_path, vec!["app/api".to_owned(), "app/lib".to_owned()]);
 	}
 
 	#[test]
