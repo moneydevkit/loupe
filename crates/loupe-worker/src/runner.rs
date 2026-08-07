@@ -291,6 +291,7 @@ impl Runner {
 				};
 
 				let mut all = Vec::new();
+				let mut failed = Vec::new();
 				for s in &self.scanners {
 					tracing::info!(job_id = env.job_id, scanner = s.id(), "running scanner");
 					match s.scan(&ctx).await {
@@ -313,13 +314,30 @@ impl Runner {
 							);
 							all.append(&mut findings);
 						},
-						Err(e) => tracing::warn!(scanner = s.id(), error = %e, "scanner failed"),
+						Err(e) => {
+							tracing::warn!(scanner = s.id(), error = %e, "scanner failed");
+							failed.push(format!("{}: {e:#}", s.id()));
+						},
 					}
 				}
+				// Submit even when a scanner failed: the server owns
+				// failed-job semantics (it discards the job's pending
+				// findings; the retry regenerates them).
 				if !all.is_empty() {
 					let batch =
 						FindingsBatch { protocol_version: PROTOCOL_VERSION, findings: all.clone() };
 					self.client.submit_findings(env.job_id, &batch).await?;
+				}
+				// A failed scanner means coverage is unknown; failing the
+				// job keeps last_scanned_sha frozen so the next scan
+				// retries this diff.
+				if !failed.is_empty() {
+					anyhow::bail!(
+						"{} of {} scanners failed: {}",
+						failed.len(),
+						self.scanners.len(),
+						failed.join("; ")
+					);
 				}
 				Ok((Some(head_sha), all.len()))
 			},
