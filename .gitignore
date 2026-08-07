@@ -36,3 +36,6 @@ Cargo.lock.bak
 
 # local VM root disk (deploy/README.md)
 loupe.qcow2
+
+# generated findings report (just report)
+loupe-findings.html

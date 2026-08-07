@@ -89,6 +89,17 @@
             ];
             text = builtins.readFile ./nix/bootstrap.sh;
           };
+
+          # Renders a repo's findings to a self-contained HTML file by
+          # shelling loupectl. Stdlib only; runs on the box where the
+          # admin bundle lives (see `just report`).
+          report = pkgs.writers.writePython3Bin "loupe-report" {
+            flakeIgnore = [
+              "E501" # long lines: the inline CSS strings are intentional.
+              "E226" # missing whitespace around arithmetic operators.
+              "W503" # line break before binary operator (PEP8 now prefers it).
+            ];
+          } (builtins.readFile ./nix/loupe-report.py);
         }
         // {
           # Bitcoin Knowledge Base MCP server for the discovery agent.

@@ -14,6 +14,7 @@ vm_port := "2223"
 # abort ssh. Host key is unpinned because it is regenerated whenever
 # loupe.qcow2 is recreated.
 ssh := "ssh -i " + home_directory() + "/.ssh/id_ed25519 -p " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@localhost"
+scp := "scp -i " + home_directory() + "/.ssh/id_ed25519 -P " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
 default:
     @just --list
@@ -92,3 +93,10 @@ jobs:
 # List findings for a repo. `just findings 1`
 findings id:
     {{ssh}} loupectl finding list {{id}}
+
+# Render a repo's findings to a self-contained HTML report and copy it
+# to ./loupe-findings.html on the host. `just report 2`
+report id="1":
+    {{ssh}} loupe-report {{id}} -o /tmp/loupe-findings.html
+    {{scp}} root@localhost:/tmp/loupe-findings.html ./loupe-findings.html
+    @echo "wrote ./loupe-findings.html (open with: xdg-open loupe-findings.html)"

@@ -91,6 +91,7 @@ in
   environment.systemPackages = [
     loupectl-admin
     loupePkgs.bootstrap
+    loupePkgs.report
   ];
 
   services.loupe = {
