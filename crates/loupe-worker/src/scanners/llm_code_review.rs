@@ -132,7 +132,7 @@ impl Scanner for LlmCodeReviewScanner {
 			"llm-code-review starting agent fan-out"
 		);
 
-		let errors = self
+		let failed = self
 			.run_all(
 				&cfg,
 				&ctx.workdir,
@@ -143,14 +143,12 @@ impl Scanner for LlmCodeReviewScanner {
 				&ctx.cancel,
 			)
 			.await;
-		// Hard-fail when every agent session errored. Without this, an
-		// LLM scanner that's completely broken (sandbox can't reach the
-		// CLI, auth missing, network blocked) would silently complete
-		// as "succeeded with 0 findings", which an operator can't tell
-		// apart from "this is a clean repo." The agent producing no
-		// findings on a healthy session is a success — only backend /
-		// sandbox errors fail the scan.
-		if errors > 0 && errors == files.len() {
+		// Hard-fail when every agent session errored, without burning a
+		// retry round: a 100% failure rate is environmental (sandbox
+		// can't reach the CLI, auth missing, network blocked), not a
+		// flake. The agent producing no findings on a healthy session
+		// is a success — only backend / sandbox errors fail the scan.
+		if !failed.is_empty() && failed.len() == files.len() {
 			anyhow::bail!(
 				"llm-code-review: every one of {n} agent sessions errored; \
 				 check worker logs for the underlying error (`RUST_LOG=loupe_worker=debug` \
@@ -158,11 +156,44 @@ impl Scanner for LlmCodeReviewScanner {
 				n = files.len(),
 			);
 		}
-		if errors > 0 {
+		// Retry partial failures once so a flaky call (timeout, transient
+		// backend error) doesn't fail the whole scan.
+		let failed = if failed.is_empty() || ctx.cancel.is_cancelled() {
+			failed
+		} else {
 			tracing::warn!(
-				errored = errors,
+				errored = failed.len(),
 				total = files.len(),
-				"llm-code-review: some agent sessions errored",
+				"llm-code-review: retrying failed agent sessions",
+			);
+			self.run_all(
+				&cfg,
+				&ctx.workdir,
+				&failed,
+				ctx.repo_id,
+				ctx.job_id,
+				self.bkb_hint,
+				&ctx.cancel,
+			)
+			.await
+		};
+		// A file failing twice fails the scan: completing would advance
+		// last_scanned_sha over a file that was never analysed, and the
+		// gap would never be rescanned.
+		if !failed.is_empty() && !ctx.cancel.is_cancelled() {
+			let rels: Vec<String> = failed
+				.iter()
+				.map(|p| p.strip_prefix(&ctx.workdir).unwrap_or(p).to_string_lossy().into_owned())
+				.collect();
+			const SHOWN: usize = 20;
+			let more = rels.len().saturating_sub(SHOWN);
+			let mut list = rels.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+			if more > 0 {
+				list.push_str(&format!(" (+{more} more)"));
+			}
+			anyhow::bail!(
+				"llm-code-review: {n} agent sessions still failing after a retry: {list}",
+				n = failed.len(),
 			);
 		}
 		tracing::info!("llm-code-review finished; submissions arrived via MCP");
@@ -176,13 +207,14 @@ impl Scanner for LlmCodeReviewScanner {
 
 impl LlmCodeReviewScanner {
 	/// Fan out one agent session per file with bounded concurrency.
-	/// Returns the count of session-level errors; per-session "no
-	/// finding" is a success (not an error).
+	/// Returns the input paths whose sessions errored; per-session "no
+	/// finding" is a success (not an error). Files skipped because of
+	/// cancellation are not reported as failures.
 	#[allow(clippy::too_many_arguments)]
 	async fn run_all(
 		&self, cfg: &ScannerConfig, workdir: &Path, files: &[PathBuf], repo_id: i64, job_id: i64,
 		bkb_hint: &'static str, cancel: &CancellationToken,
-	) -> usize {
+	) -> Vec<PathBuf> {
 		let sem = Arc::new(Semaphore::new(cfg.max_concurrent_files));
 		let mut handles = Vec::with_capacity(files.len());
 		for path in files {
@@ -193,27 +225,30 @@ impl LlmCodeReviewScanner {
 			let backend = self.backend.clone();
 			let cfg_owned = cfg.clone();
 			let workdir = workdir.to_path_buf();
-			let path = path.clone();
+			let task_path = path.clone();
 			let cancel = cancel.clone();
-			handles.push(tokio::spawn(async move {
+			let task = tokio::spawn(async move {
 				let _permit = permit;
-				run_one(backend, &workdir, &path, &cfg_owned, repo_id, job_id, bkb_hint, cancel)
-					.await
-			}));
+				run_one(
+					backend, &workdir, &task_path, &cfg_owned, repo_id, job_id, bkb_hint, cancel,
+				)
+				.await
+			});
+			handles.push((path.clone(), task));
 		}
 
-		let mut errors = 0usize;
-		for h in handles {
+		let mut failed = Vec::new();
+		for (path, h) in handles {
 			match h.await {
 				Ok(Ok(())) => {},
-				Ok(Err(())) => errors += 1,
+				Ok(Err(())) => failed.push(path),
 				Err(e) => {
 					tracing::warn!(error = %e, "agent session task panicked");
-					errors += 1;
+					failed.push(path);
 				},
 			}
 		}
-		errors
+		failed
 	}
 }
 
@@ -246,8 +281,8 @@ async fn changed_paths_between(workdir: &Path, base: &str, head: &str) -> Result
 }
 
 /// Run one agent session against `file`. Returns `Err(())` for
-/// session-level errors (sandbox / network / CLI failure); the call
-/// counts these and fails the scan when every attempt errors. A
+/// session-level errors (sandbox / network / CLI failure); the caller
+/// retries failed files once and fails the scan if any persist. A
 /// healthy session that produced no submission still returns `Ok(())`
 /// — the agent decided there was nothing to report.
 #[allow(clippy::too_many_arguments)]
@@ -360,15 +395,78 @@ mod tests {
 	async fn scanner_fails_loud_when_every_session_errors() {
 		// Sandbox / network / CLI being completely broken must not
 		// silently complete as "0 findings" — that's
-		// indistinguishable from a clean repo.
+		// indistinguishable from a clean repo. And it must not burn a
+		// retry round: total failure is environmental, not a flake.
 		let tmp = tempfile::tempdir().unwrap();
 		write_crate(tmp.path(), &[("src/lib.rs", "// a\n")]);
-		let backend = Arc::new(StubLlmBackend::new("stub", |_req: &LlmRequest| {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let calls_for_stub = calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |_req: &LlmRequest| {
+			calls_for_stub.fetch_add(1, Ordering::SeqCst);
 			Err(anyhow::anyhow!("backend exploded"))
 		}));
 		let scanner = LlmCodeReviewScanner::new(backend);
 		let err = scanner.scan(&make_ctx(tmp.path())).await.expect_err("must fail");
 		assert!(err.to_string().contains("agent session"), "unexpected error: {err}");
+		assert_eq!(calls.load(Ordering::SeqCst), 1, "total failure must not be retried");
+	}
+
+	#[tokio::test]
+	async fn flaky_session_is_retried_and_the_scan_succeeds() {
+		// One transient per-file failure must not fail the scan (or,
+		// worse, silently drop the file): the failed session is re-run
+		// at the end of the fan-out.
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// a\n"), ("src/util.rs", "// b\n")]);
+
+		let util_calls = Arc::new(AtomicUsize::new(0));
+		let util_calls_for_stub = util_calls.clone();
+		let lib_calls = Arc::new(AtomicUsize::new(0));
+		let lib_calls_for_stub = lib_calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+			if req.prompt.contains("src/util.rs") {
+				// First attempt flakes, second succeeds.
+				if util_calls_for_stub.fetch_add(1, Ordering::SeqCst) == 0 {
+					return Err(anyhow::anyhow!("transient timeout"));
+				}
+			} else {
+				lib_calls_for_stub.fetch_add(1, Ordering::SeqCst);
+			}
+			Ok(String::new())
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+
+		scanner.scan(&make_ctx(tmp.path())).await.expect("one flake must be recoverable");
+		assert_eq!(util_calls.load(Ordering::SeqCst), 2, "flaky file gets exactly one retry");
+		assert_eq!(lib_calls.load(Ordering::SeqCst), 1, "healthy file is not re-run");
+	}
+
+	#[tokio::test]
+	async fn persistently_failing_file_fails_the_scan_and_is_named() {
+		// A file that errors on the retry too must fail the scan — the
+		// runner marks the job failed, the watermark stays frozen, and
+		// the next scan retries the diff. The error names the file so
+		// the operator can act (raise the timeout, exclude the path).
+		let tmp = tempfile::tempdir().unwrap();
+		write_crate(tmp.path(), &[("src/lib.rs", "// a\n"), ("src/util.rs", "// b\n")]);
+
+		let util_calls = Arc::new(AtomicUsize::new(0));
+		let util_calls_for_stub = util_calls.clone();
+		let backend = Arc::new(StubLlmBackend::new("stub", move |req: &LlmRequest| {
+			if req.prompt.contains("src/util.rs") {
+				util_calls_for_stub.fetch_add(1, Ordering::SeqCst);
+				return Err(anyhow::anyhow!("still timing out"));
+			}
+			Ok(String::new())
+		}));
+		let scanner = LlmCodeReviewScanner::new(backend);
+
+		let err = scanner.scan(&make_ctx(tmp.path())).await.expect_err("must fail");
+		assert!(
+			err.to_string().contains("src/util.rs"),
+			"error must name the unscanned file, got: {err}"
+		);
+		assert_eq!(util_calls.load(Ordering::SeqCst), 2, "retries are bounded to one");
 	}
 
 	#[tokio::test]
