@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use loupe_core::ReportingDestination;
 use loupe_proto::{
-	ListReposResponse, RegisterRepoRequest, ReportingSetup, RotateRepoPatRequest,
+	ListReposResponse, RegisterRepoRequest, ReportingSetup, ReportingSummary, RotateRepoPatRequest,
 	SetRepoGithubReportingRequest, PROTOCOL_VERSION,
 };
 use loupe_server::init::run_init;
@@ -185,6 +185,15 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	assert_eq!(body.repos[0].disabled_at, None);
 	assert!(body.repos[0].verification_enabled);
 	assert_eq!(body.repos[0].require_approval, Some(false));
+	// The listing reports which reporter is configured, with the
+	// non-secret targets but never the storage-side secret id.
+	assert_eq!(
+		body.repos[0].reporting,
+		Some(ReportingSummary::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+		})
+	);
 
 	// Delete cascades.
 	let resp =
@@ -194,6 +203,75 @@ async fn admin_can_register_list_and_delete_a_repo() {
 	let resp = admin.get("https://loupe-server/v1/repos").send().await.unwrap();
 	let body: ListReposResponse = resp.json().await.unwrap();
 	assert!(body.repos.is_empty());
+
+	f.handle.shutdown().await;
+}
+
+/// The repo listing has to tell a client *which* reporter each repo uses —
+/// PAT rotation only applies to `github_issue`, and the server 400s a
+/// rotation against anything else — while never exposing the PAT itself or
+/// the `secrets` row id it lives behind.
+#[tokio::test]
+async fn repo_listing_reports_reporter_kind_without_secrets() {
+	let f = bring_up().await;
+	let admin = admin_client(&f.ca_cert_pem, &f.admin_cert_pem, &f.admin_key_pem, f.addr);
+
+	let cases = [
+		(
+			"https://github.com/acme/gh.git",
+			ReportingSetup::GithubIssue {
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+				github_pat: "ghp_do_not_leak".into(),
+			},
+		),
+		(
+			"https://github.com/acme/mail.git",
+			ReportingSetup::Email {
+				to: vec!["sec@acme.test".into()],
+				from: Some("loupe@acme.test".into()),
+				subject_prefix: Some("[loupe]".into()),
+			},
+		),
+		("https://github.com/acme/manual.git", ReportingSetup::Manual),
+	];
+	for (clone_url, reporting) in cases {
+		let req = RegisterRepoRequest::new(clone_url, reporting);
+		let resp = admin.post("https://loupe-server/v1/repos").json(&req).send().await.unwrap();
+		assert_eq!(resp.status(), 201, "create {clone_url}: {}", resp.status());
+	}
+
+	// Assert on the raw body, not just the deserialized DTO: a leak would
+	// be a stray JSON key, which a typed round-trip would silently drop.
+	let raw =
+		admin.get("https://loupe-server/v1/repos").send().await.unwrap().text().await.unwrap();
+	assert!(!raw.contains("ghp_do_not_leak"), "PAT leaked into the repo listing: {raw}");
+	assert!(!raw.contains("pat_secret_id"), "secret id leaked into the repo listing: {raw}");
+
+	let body: ListReposResponse = serde_json::from_str(&raw).unwrap();
+	let by_repo = |name: &str| {
+		body.repos
+			.iter()
+			.find(|r| r.repo == name)
+			.unwrap_or_else(|| panic!("no repo {name}"))
+			.clone()
+	};
+	assert_eq!(
+		by_repo("gh").reporting,
+		Some(ReportingSummary::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+		})
+	);
+	assert_eq!(
+		by_repo("mail").reporting,
+		Some(ReportingSummary::Email {
+			to: vec!["sec@acme.test".into()],
+			from: Some("loupe@acme.test".into()),
+			subject_prefix: Some("[loupe]".into()),
+		})
+	);
+	assert_eq!(by_repo("manual").reporting, Some(ReportingSummary::Manual));
 
 	f.handle.shutdown().await;
 }

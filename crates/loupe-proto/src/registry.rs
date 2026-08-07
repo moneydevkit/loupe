@@ -1,3 +1,4 @@
+use loupe_core::ReportingDestination;
 use serde::{Deserialize, Serialize};
 
 use crate::version::PROTOCOL_VERSION;
@@ -122,13 +123,61 @@ pub struct UpdateRepoRequest {
 	pub inherit_require_approval: bool,
 }
 
-/// Response body of `GET /v1/repos`. `RepoSummary` deliberately omits
-/// the storage-only `reporting` JSON — clients don't need it, and it
-/// would leak `pat_secret_id` references that have no meaning to them.
+/// Response body of `GET /v1/repos`. `RepoSummary` carries a sanitized
+/// [`ReportingSummary`] rather than the storage-only
+/// `loupe_core::ReportingDestination`, so clients learn *which* reporter
+/// a repo uses without ever seeing `pat_secret_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListReposResponse {
 	pub protocol_version: u16,
 	pub repos: Vec<RepoSummary>,
+}
+
+/// Non-secret view of a repo's reporting destination.
+///
+/// Mirrors `loupe_core::ReportingDestination` minus `pat_secret_id`.
+/// Clients need the reporter *kind* to decide which actions apply — PAT
+/// rotation is only meaningful for `GithubIssue`, and the server 400s a
+/// rotation attempt against any other destination — but the storage-side
+/// secret id has no meaning off the server and must never leave it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReportingSummary {
+	GithubIssue {
+		target_owner: String,
+		target_repo: String,
+	},
+	Email {
+		to: Vec<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		from: Option<String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		subject_prefix: Option<String>,
+	},
+	Manual,
+}
+
+impl From<&ReportingDestination> for ReportingSummary {
+	fn from(dest: &ReportingDestination) -> Self {
+		// Destructured field-by-field on purpose: no `..` rest pattern, so
+		// adding a field to `ReportingDestination` fails to compile here
+		// and forces a deliberate "does this belong on the wire?" call
+		// rather than silently leaking or silently dropping it.
+		match dest {
+			ReportingDestination::GithubIssue { target_owner, target_repo, pat_secret_id: _ } => {
+				Self::GithubIssue {
+					target_owner: target_owner.clone(),
+					target_repo: target_repo.clone(),
+				}
+			},
+			ReportingDestination::Email { to, from, subject_prefix } => Self::Email {
+				to: to.clone(),
+				from: from.clone(),
+				subject_prefix: subject_prefix.clone(),
+			},
+			ReportingDestination::Manual => Self::Manual,
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +201,12 @@ pub struct RepoSummary {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_scanned_at: Option<i64>,
 	pub created_at: i64,
+	/// Which reporter this repo is configured for, without secret
+	/// material. `Option` because the field is additive: a client built
+	/// against a newer protocol must still deserialize responses from a
+	/// server that predates it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reporting: Option<ReportingSummary>,
 }
 
 /// Body of `POST /v1/workers` (admin-only). Returns the freshly-minted
@@ -212,6 +267,91 @@ mod tests {
 		);
 		let back: RegisterRepoRequest = serde_json::from_str(&s).unwrap();
 		assert_eq!(back.verification_enabled, None);
+	}
+
+	fn summary_with_reporting(reporting: Option<ReportingSummary>) -> RepoSummary {
+		RepoSummary {
+			id: 1,
+			clone_url: "https://github.com/acme/widget.git".into(),
+			host: "github.com".into(),
+			owner: "acme".into(),
+			repo: "widget".into(),
+			default_branch: Some("main".into()),
+			scan_interval_seconds: Some(3600),
+			disabled_at: None,
+			verification_enabled: true,
+			require_approval: None,
+			last_scanned_sha: None,
+			last_scanned_at: None,
+			created_at: 42,
+			reporting,
+		}
+	}
+
+	#[test]
+	fn reporting_summary_drops_the_pat_secret_id() {
+		let dest = ReportingDestination::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+			pat_secret_id: 7,
+		};
+		let summary = ReportingSummary::from(&dest);
+		assert_eq!(
+			summary,
+			ReportingSummary::GithubIssue {
+				target_owner: "acme".into(),
+				target_repo: "tracker".into(),
+			}
+		);
+
+		// The whole point of the type: the storage-side secret id must not
+		// survive the conversion onto the wire.
+		let s = serde_json::to_string(&summary).unwrap();
+		assert!(s.contains(r#""kind":"github_issue""#), "kind must be tagged: {s}");
+		assert!(s.contains("acme"), "non-secret target must survive: {s}");
+		assert!(!s.contains("pat_secret_id"), "secret id leaked onto the wire: {s}");
+		assert!(!s.contains('7'), "secret id value leaked onto the wire: {s}");
+	}
+
+	#[test]
+	fn reporting_summary_preserves_email_and_manual() {
+		let email = ReportingDestination::Email {
+			to: vec!["sec@acme.test".into()],
+			from: Some("loupe@acme.test".into()),
+			subject_prefix: Some("[loupe]".into()),
+		};
+		assert_eq!(
+			ReportingSummary::from(&email),
+			ReportingSummary::Email {
+				to: vec!["sec@acme.test".into()],
+				from: Some("loupe@acme.test".into()),
+				subject_prefix: Some("[loupe]".into()),
+			}
+		);
+		assert_eq!(ReportingSummary::from(&ReportingDestination::Manual), ReportingSummary::Manual);
+	}
+
+	#[test]
+	fn repo_summary_round_trips_with_reporting() {
+		let summary = summary_with_reporting(Some(ReportingSummary::GithubIssue {
+			target_owner: "acme".into(),
+			target_repo: "tracker".into(),
+		}));
+		let s = serde_json::to_string(&summary).unwrap();
+		let back: RepoSummary = serde_json::from_str(&s).unwrap();
+		assert_eq!(summary, back);
+		assert!(!s.contains("pat_secret_id"));
+	}
+
+	#[test]
+	fn repo_summary_tolerates_a_response_without_reporting() {
+		// `reporting` is additive, so a client built against this protocol
+		// must still read a response from a server that never sends it.
+		let summary = summary_with_reporting(None);
+		let s = serde_json::to_string(&summary).unwrap();
+		assert!(!s.contains("reporting"), "absent reporting should not be serialized: {s}");
+		let back: RepoSummary = serde_json::from_str(&s).unwrap();
+		assert_eq!(back.reporting, None);
 	}
 
 	#[test]

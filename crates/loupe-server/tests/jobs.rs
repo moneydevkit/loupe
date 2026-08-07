@@ -269,6 +269,77 @@ async fn list_routes_reject_non_positive_limits() {
 }
 
 #[tokio::test]
+async fn job_list_filters_by_state_and_kind() {
+	let f = bring_up_with_repo_and_worker().await;
+	let repo_b = register_repo(&f, "https://github.com/acme/b.git", "tracker-b").await;
+
+	let list = |query: &str| {
+		let admin = f.admin.clone();
+		let url = format!("https://loupe-server/v1/jobs?{query}");
+		async move {
+			let resp = admin.get(url).send().await.unwrap();
+			assert!(resp.status().is_success(), "{} for {}", resp.status(), resp.url());
+			resp.json::<Vec<JobInfo>>().await.unwrap()
+		}
+	};
+
+	let first = enqueue_scan(&f, f.repo_id).await;
+	enqueue_scan(&f, repo_b).await;
+	// Lease one so the two jobs sit in different states.
+	let leased = lease_job(&f.worker).await;
+	assert_eq!(leased.job_id, first.job_id, "oldest queued job leases first");
+
+	let queued = list("state=queued").await;
+	assert_eq!(queued.len(), 1, "exactly one job is still queued: {queued:?}");
+	assert!(queued.iter().all(|j| j.state == JobState::Queued));
+
+	let leased_jobs = list("state=leased").await;
+	assert_eq!(leased_jobs.len(), 1);
+	assert_eq!(leased_jobs[0].job_id, first.job_id);
+
+	// A comma-separated set is one request for the whole "finished" group,
+	// which is why the filter takes a list rather than a single value.
+	assert!(list("state=succeeded,failed,cancelled").await.is_empty(), "nothing has finished yet");
+	let both = list("state=queued,leased").await;
+	assert_eq!(both.len(), 2, "the set matches either state: {both:?}");
+
+	// kind composes with state as AND.
+	assert_eq!(list("kind=scan").await.len(), 2);
+	assert!(list("kind=verify").await.is_empty(), "no verify jobs exist yet");
+	assert_eq!(list("state=queued&kind=scan").await.len(), 1);
+	assert!(list("state=queued&kind=verify").await.is_empty());
+
+	// Filters compose with limit.
+	assert_eq!(list("state=queued,leased&limit=1").await.len(), 1);
+
+	f.handle.shutdown().await;
+}
+
+/// A typo'd filter that silently returned everything would be worse than
+/// an error: the caller would believe it had filtered.
+#[tokio::test]
+async fn job_list_rejects_unknown_state_and_kind() {
+	let f = bring_up_with_repo_and_worker().await;
+	enqueue_scan(&f, f.repo_id).await;
+
+	let cases = [
+		("state=bogus", "unknown job state"),
+		("state=queued,bogus", "unknown job state"),
+		("state=", "state must name at least one job state"),
+		("kind=bogus", "unknown job kind"),
+	];
+	for (query, expected) in cases {
+		let resp =
+			f.admin.get(format!("https://loupe-server/v1/jobs?{query}")).send().await.unwrap();
+		assert_eq!(resp.status(), 400, "{query} should be rejected");
+		let body = resp.text().await.unwrap();
+		assert!(body.contains(expected), "unexpected body for {query}: {body}");
+	}
+
+	f.handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn finding_list_limit_can_exceed_default_page() {
 	let f = bring_up_with_repo_and_worker().await;
 	let scan = enqueue_scan(&f, f.repo_id).await;
@@ -408,6 +479,85 @@ async fn end_to_end_scan_lifecycle() {
 		f.db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM scan_history", [], |r| r.get(0))?))
 			.unwrap();
 	assert_eq!(history_count, 1);
+
+	f.handle.shutdown().await;
+}
+
+/// A job listing has to answer "how long did this take, who ran it, and
+/// why did it fail" without a second round-trip, so the lease/timing/error
+/// block must be populated at each stage rather than only in the DB.
+#[tokio::test]
+async fn job_info_reports_lease_timing_and_failure_detail() {
+	let f = bring_up_with_repo_and_worker().await;
+
+	let get_job = |job_id: i64| {
+		let admin = f.admin.clone();
+		async move {
+			admin
+				.get(format!("https://loupe-server/v1/jobs/{job_id}"))
+				.send()
+				.await
+				.unwrap()
+				.json::<JobInfo>()
+				.await
+				.unwrap()
+		}
+	};
+
+	// Queued: nothing has run yet, so the whole block is absent.
+	let scan = enqueue_scan(&f, f.repo_id).await;
+	let queued = get_job(scan.job_id).await;
+	assert_eq!(queued.state, JobState::Queued);
+	assert_eq!(queued.worker_id, None, "a queued job has no worker");
+	assert_eq!(queued.lease_expires_at, None);
+	assert_eq!(queued.started_at, None);
+	assert_eq!(queued.finished_at, None);
+	assert_eq!(queued.error, None);
+
+	// Leased: worker and lease deadline become visible.
+	let env = lease_job(&f.worker).await;
+	let leased = get_job(env.job_id).await;
+	assert_eq!(leased.state, JobState::Leased);
+	assert!(leased.worker_id.is_some(), "a leased job names its worker");
+	let lease_expires_at = leased.lease_expires_at.expect("leased job has a lease deadline");
+	let started_at = leased.started_at.expect("leased job has a start time");
+	assert!(
+		lease_expires_at > started_at,
+		"lease deadline {lease_expires_at} must be after start {started_at}"
+	);
+	assert_eq!(leased.finished_at, None, "a leased job has not finished");
+
+	// Failed: the worker's reason reaches the listing verbatim.
+	let resp = f
+		.worker
+		.post(format!("https://loupe-server/v1/jobs/{}/complete", env.job_id))
+		.json(&CompleteRequest {
+			protocol_version: PROTOCOL_VERSION,
+			outcome: CompleteOutcome::Failed,
+			head_sha: None,
+			error: Some("clone failed: host unreachable".into()),
+		})
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(resp.status(), 204);
+
+	let failed = get_job(env.job_id).await;
+	assert_eq!(failed.state, JobState::Failed);
+	assert_eq!(failed.error.as_deref(), Some("clone failed: host unreachable"));
+	let finished_at = failed.finished_at.expect("a terminal job has a finish time");
+	assert!(
+		finished_at >= failed.started_at.expect("still has its start time"),
+		"finish {finished_at} must not precede start"
+	);
+	assert_eq!(failed.attempts, 1, "one lease means one attempt");
+
+	// The same detail shows up in the list view, not just the by-id route.
+	let listed: Vec<JobInfo> =
+		f.admin.get("https://loupe-server/v1/jobs").send().await.unwrap().json().await.unwrap();
+	let listed = listed.iter().find(|j| j.job_id == env.job_id).expect("job is listed");
+	assert_eq!(listed.error.as_deref(), Some("clone failed: host unreachable"));
+	assert_eq!(listed.finished_at, Some(finished_at));
 
 	f.handle.shutdown().await;
 }

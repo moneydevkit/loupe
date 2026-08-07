@@ -18,6 +18,7 @@ use crate::state::AppState;
 
 fn row_to_summary(r: RepoRow) -> RepoSummary {
 	RepoSummary {
+		reporting: Some((&r.reporting).into()),
 		id: r.id,
 		clone_url: r.clone_url,
 		host: r.host,
@@ -121,9 +122,10 @@ pub async fn create(
 	))
 }
 
-/// `GET /v1/repos` — admin only. Lists all registered repos. Reporting
-/// JSON is **not** included: it carries `pat_secret_id` references that
-/// are storage-internal.
+/// `GET /v1/repos` — admin only. Lists all registered repos. The stored
+/// reporting JSON is mapped to a sanitized `ReportingSummary` first: the
+/// reporter kind and its non-secret targets go out, the storage-internal
+/// `pat_secret_id` does not.
 pub async fn list(
 	State(state): State<AppState>, Query(qp): Query<ListQuery>,
 ) -> Result<Json<ListReposResponse>, (StatusCode, String)> {

@@ -17,12 +17,17 @@ crates/
   loupe-worker    worker binary + scanner trait + LLM backend + sandbox
                   + MCP server (mcp-serve subcommand)
   loupe-cli       loupectl admin CLI
+  loupe-web       loupe-web local operator dashboard (loopback HTTP,
+                  proxies the same admin RPCs as loupectl)
 ```
 
-Three deployable binaries: `loupe-server`, `loupe-worker`, and
-`loupectl`. The worker binary doubles as the MCP server (`loupe-worker
+Four deployable binaries: `loupe-server`, `loupe-worker`, `loupectl`, and
+`loupe-web`. The worker binary doubles as the MCP server (`loupe-worker
 mcp-serve`) — same code, different subcommand, spawned by the agent
-inside the sandbox.
+inside the sandbox. `loupe-web` is an optional operator convenience: it
+holds the same admin certificate `loupectl` uses and proxies the same
+routes, so it adds no new authority to the system and no new trust root.
+It binds loopback only, for the reasons in README §9.
 
 ## Component diagram
 
@@ -265,9 +270,17 @@ instance. There are three client cert "roles":
 
 - **server**: server's leaf cert, presented when clients connect
   (DNS / IP SANs are populated from `--hostname` at init time).
-- **admin**: minted once at init, used by `loupectl`. Authorized
-  for the `admin_only` route group (CRUD on repos / workers / jobs,
-  approve/reject, ad-hoc scan triggers).
+- **admin**: minted once at init, used by `loupectl` and by `loupe-web`.
+  Authorized for the `admin_only` route group (CRUD on repos / workers /
+  jobs, approve/reject, ad-hoc scan triggers). Note that a client cert
+  does not encode its role — `admin` versus `worker` is decided solely by
+  the `kind` column in the `workers` table, so only the server can tell
+  them apart. Anything that terminates a connection *outside* the server
+  therefore cannot authorize by chain validation alone; this is why
+  `loupe-web` gates on a local token rather than on a presented cert. The
+  browser keeps that token in origin-scoped session storage and presents
+  it only in a dedicated API header; a cookie would leak across loopback
+  ports.
 - **worker**: minted at `loupectl worker register` time. Authorized
   for the `worker_only` group (lease, heartbeat, submit_findings,
   submit_verdict, complete) plus the shared `authed` group (FTS

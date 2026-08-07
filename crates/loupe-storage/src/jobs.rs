@@ -8,7 +8,8 @@
 use loupe_core::{
 	initial_job_state, FindingState, JobKind, JobState, JobTransition, StateTransitionError,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 /// Lease lifetime in seconds. Worker must heartbeat or complete before
 /// `lease_expires_at` or the reaper will reclaim the job.
@@ -333,19 +334,57 @@ pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<JobRow>> {
 	.optional()
 }
 
-pub fn list(conn: &Connection, limit: Option<i64>) -> rusqlite::Result<Vec<JobRow>> {
+/// Optional narrowing for [`list`]. `Default` means "everything, newest
+/// first" — the historical behaviour.
+///
+/// `states` is a set rather than a single value because the useful
+/// grouping for an operator is "finished", which spans three states.
+/// Asking for them together is one query against the shared connection
+/// instead of three.
+#[derive(Debug, Clone, Default)]
+pub struct JobFilter {
+	/// Empty means "any state".
+	pub states: Vec<JobState>,
+	pub kind: Option<JobKind>,
+	pub limit: Option<i64>,
+}
+
+pub fn list(conn: &Connection, filter: &JobFilter) -> rusqlite::Result<Vec<JobRow>> {
+	let mut clauses: Vec<String> = Vec::new();
+	let mut args: Vec<Value> = Vec::new();
+
+	if !filter.states.is_empty() {
+		let placeholders = vec!["?"; filter.states.len()].join(", ");
+		clauses.push(format!("state IN ({placeholders})"));
+		args.extend(filter.states.iter().map(|s| Value::Text(s.as_str().to_owned())));
+	}
+	if let Some(kind) = filter.kind {
+		clauses.push("kind = ?".to_owned());
+		args.push(Value::Text(kind.as_str().to_owned()));
+	}
+
+	let where_sql = if clauses.is_empty() {
+		String::new()
+	} else {
+		format!(" WHERE {}", clauses.join(" AND "))
+	};
+	let limit_sql = match filter.limit {
+		Some(limit) => {
+			args.push(Value::Integer(limit));
+			" LIMIT ?"
+		},
+		None => "",
+	};
 	let sql = format!(
 		"SELECT {JOB_COLUMNS}
-		 FROM jobs
-		 ORDER BY enqueued_at DESC, id DESC",
+		 FROM jobs{where_sql}
+		 ORDER BY enqueued_at DESC, id DESC{limit_sql}"
 	);
-	let Some(limit) = limit else {
-		let mut stmt = conn.prepare(&sql)?;
-		let rows = stmt.query_map([], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?;
-		return Ok(rows);
-	};
-	let mut stmt = conn.prepare(&format!("{sql} LIMIT ?1"))?;
-	let rows = stmt.query_map(params![limit], row_to_job)?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+	let mut stmt = conn.prepare(&sql)?;
+	let rows = stmt
+		.query_map(params_from_iter(args), row_to_job)?
+		.collect::<rusqlite::Result<Vec<_>>>()?;
 	Ok(rows)
 }
 
@@ -406,7 +445,8 @@ pub fn reap_stale_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 		"UPDATE jobs
 		   SET state = ?2,
 		       worker_id = NULL,
-		       lease_expires_at = NULL
+		       lease_expires_at = NULL,
+		       started_at = NULL
 		 WHERE state = 'leased'
 		   AND lease_expires_at < ?1
 		   AND attempts < ?3",
@@ -505,6 +545,111 @@ mod tests {
 			.with_conn(|c| Ok(workers::insert(c, "w1", WorkerKind::Worker, &[1u8; 32], 0)?))
 			.unwrap();
 		(db, repo_id, worker_id)
+	}
+
+	fn enqueue_job(db: &Db, repo_id: i64, kind: JobKind, at: i64) -> i64 {
+		db.with_conn(|c| {
+			Ok(enqueue(
+				c,
+				&NewJob {
+					repo_id,
+					kind,
+					incremental: false,
+					since_sha: None,
+					parent_job_id: None,
+					target_finding_id: None,
+				},
+				at,
+			)?)
+		})
+		.unwrap()
+	}
+
+	fn listed(db: &Db, filter: &JobFilter) -> Vec<(i64, JobState, JobKind)> {
+		db.with_conn(|c| Ok(list(c, filter)?))
+			.unwrap()
+			.into_iter()
+			.map(|r| (r.id, r.state, r.kind))
+			.collect()
+	}
+
+	#[test]
+	fn list_filters_by_state_and_kind() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let queued_scan = enqueue_job(&db, repo_id, JobKind::Scan, 100);
+		let queued_verify = enqueue_job(&db, repo_id, JobKind::Verify, 200);
+		let leased_scan = enqueue_job(&db, repo_id, JobKind::Scan, 300);
+
+		// Verify jobs are leased first, so ask twice to move the scan too.
+		for _ in 0..2 {
+			db.with_conn(|c| Ok(lease_next(c, worker_id, true, 400, DEFAULT_LEASE_SECONDS)?))
+				.unwrap();
+		}
+		// Of the three, the verify job and the *oldest* scan got leased.
+		let all = listed(&db, &JobFilter::default());
+		assert_eq!(all.len(), 3, "default filter returns everything: {all:?}");
+
+		let queued =
+			listed(&db, &JobFilter { states: vec![JobState::Queued], ..Default::default() });
+		assert_eq!(queued, vec![(leased_scan, JobState::Queued, JobKind::Scan)]);
+
+		let leased =
+			listed(&db, &JobFilter { states: vec![JobState::Leased], ..Default::default() });
+		assert_eq!(leased.len(), 2, "two jobs were leased: {leased:?}");
+		assert!(leased.iter().all(|(_, s, _)| *s == JobState::Leased));
+
+		let verify = listed(&db, &JobFilter { kind: Some(JobKind::Verify), ..Default::default() });
+		assert_eq!(verify, vec![(queued_verify, JobState::Leased, JobKind::Verify)]);
+
+		// state and kind compose as AND.
+		let leased_scans = listed(
+			&db,
+			&JobFilter { states: vec![JobState::Leased], kind: Some(JobKind::Scan), limit: None },
+		);
+		assert_eq!(leased_scans, vec![(queued_scan, JobState::Leased, JobKind::Scan)]);
+	}
+
+	#[test]
+	fn list_accepts_a_set_of_states() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let to_succeed = enqueue_job(&db, repo_id, JobKind::Scan, 100);
+		let to_fail = enqueue_job(&db, repo_id, JobKind::Scan, 200);
+		let stays_queued = enqueue_job(&db, repo_id, JobKind::Scan, 300);
+
+		for (job_id, outcome) in [(to_succeed, JobState::Succeeded), (to_fail, JobState::Failed)] {
+			db.with_conn(|c| Ok(lease_next(c, worker_id, false, 400, DEFAULT_LEASE_SECONDS)?))
+				.unwrap()
+				.expect("a queued job to lease");
+			db.with_conn(|c| Ok(complete(c, job_id, worker_id, outcome, Some("sha"), None, 500)?))
+				.unwrap();
+		}
+
+		// "Finished" spans three states; one query must cover them all.
+		let finished = listed(
+			&db,
+			&JobFilter {
+				states: vec![JobState::Succeeded, JobState::Failed, JobState::Cancelled],
+				..Default::default()
+			},
+		);
+		let mut finished_ids: Vec<i64> = finished.iter().map(|(id, _, _)| *id).collect();
+		finished_ids.sort_unstable();
+		assert_eq!(finished_ids, vec![to_succeed, to_fail]);
+		assert!(
+			!finished_ids.contains(&stays_queued),
+			"a queued job must not appear in the finished set"
+		);
+	}
+
+	#[test]
+	fn list_applies_limit_alongside_filters() {
+		let (db, repo_id, _worker_id) = db_with_repo_and_worker();
+		for at in [100, 200, 300] {
+			enqueue_job(&db, repo_id, JobKind::Scan, at);
+		}
+		let limited =
+			listed(&db, &JobFilter { states: vec![JobState::Queued], kind: None, limit: Some(2) });
+		assert_eq!(limited.len(), 2, "limit must apply on top of the filter");
 	}
 
 	#[test]
@@ -907,9 +1052,57 @@ mod tests {
 		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 10)?)).unwrap();
 		let n = db.with_conn(|c| Ok(reap_stale_leases(c, 200)?)).unwrap();
 		assert_eq!(n, 1);
-		let row = db.with_conn(|c| Ok(list(c, None)?)).unwrap().pop().unwrap();
+		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Queued);
 		assert_eq!(row.attempts, 1, "reap doesn't reset attempts");
+	}
+
+	#[test]
+	fn reap_requeue_resets_attempt_timing() {
+		let (db, repo_id, worker_id) = db_with_repo_and_worker();
+		let job_id = db
+			.with_conn(|c| {
+				Ok(enqueue(
+					c,
+					&NewJob {
+						repo_id,
+						kind: JobKind::Scan,
+						incremental: false,
+						since_sha: None,
+						parent_job_id: None,
+						target_finding_id: None,
+					},
+					0,
+				)?)
+			})
+			.unwrap();
+
+		let first = db
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 100, 10)?))
+			.unwrap()
+			.expect("first attempt leases");
+		assert_eq!(first.started_at, Some(100));
+
+		db.with_conn(|c| Ok(reap_stale_leases(c, 200)?)).unwrap();
+		let queued = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
+		assert_eq!(
+			queued.started_at, None,
+			"requeue must discard the expired attempt's start time"
+		);
+
+		let second = db
+			.with_conn(|c| Ok(lease_next(c, worker_id, false, 300, 10)?))
+			.unwrap()
+			.expect("second attempt leases");
+		assert_eq!(second.started_at, Some(300), "the new attempt gets its own start time");
+		db.with_conn(|c| {
+			Ok(complete(c, job_id, worker_id, JobState::Succeeded, Some("sha"), None, 305)?)
+		})
+		.unwrap();
+
+		let finished = db.with_conn(|c| Ok(get(c, job_id)?)).unwrap().unwrap();
+		assert_eq!(finished.started_at, Some(300));
+		assert_eq!(finished.finished_at, Some(305));
 	}
 
 	#[test]
@@ -941,7 +1134,7 @@ mod tests {
 		// to failed.
 		db.with_conn(|c| Ok(lease_next(c, worker_id, false, 999, 10)?)).unwrap();
 		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c, None)?)).unwrap().pop().unwrap();
+		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);
 	}
 
@@ -1000,7 +1193,7 @@ mod tests {
 		.unwrap();
 
 		db.with_conn(|c| Ok(reap_stale_leases(c, 9_999)?)).unwrap();
-		let row = db.with_conn(|c| Ok(list(c, None)?)).unwrap().pop().unwrap();
+		let row = db.with_conn(|c| Ok(list(c, &JobFilter::default())?)).unwrap().pop().unwrap();
 		assert_eq!(row.state, JobState::Failed);
 		let pending_findings: i64 = db
 			.with_conn(|c| {
