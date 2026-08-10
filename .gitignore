@@ -34,8 +34,16 @@ Cargo.lock.bak
 # direnv
 .direnv/
 
+# Nix build
+result
+
 # local VM root disk (deploy/README.md)
 loupe.qcow2
 
-# generated findings report (just report)
-loupe-findings.html
+# generated findings reports (just report / loupe-report) — may carry
+# sensitive findings from private repos; never commit
+loupe-*.html
+
+# scratch commit message and host-local sandbox binds
+commit-message.txt
+.isolate
