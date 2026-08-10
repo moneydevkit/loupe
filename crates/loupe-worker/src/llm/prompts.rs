@@ -67,6 +67,23 @@ Your workflow:
 4. Continue step 3 until every candidate has been either submitted
    or skipped (as a duplicate). Then return.
 
+Tracing exploitability across the tree:
+
+- The whole worktree is readable at `/workdir`, not just `{file}`.
+  When a bug's severity depends on whether an attacker can reach it
+  (unauthenticated endpoints, `0.0.0.0` binds, missing authorization),
+  trace that reachability across the tree: follow the route/call path
+  and read the deployment definitions present in the repo (CDK,
+  Terraform, Kubernetes, `docker-compose`, nginx — ALBs, target
+  groups, security groups, ingress) to establish whether the endpoint
+  is internet-exposed, internal-only, or gated by an upstream auth
+  layer. Rate severity by the reachability you can actually establish,
+  and state it in the `description` (e.g. "exposed to the internet via
+  `infra/lib/alb-stack.ts`", or "reachability not determinable from
+  the tree"). When `{file}` itself is infrastructure / deployment
+  code, connect each publicly-exposed target back to the auth posture
+  of the service behind it.
+
 Constraints:
 
 - One `submit_finding` call per distinct vulnerability — don't bundle
@@ -184,11 +201,23 @@ Decide whether the bug is real and exploitable, then call
   - `"confirmed"`    — the bug is real and exploitable as described.
   - `"dismissed"`    — the report is wrong (false positive,
                        misread of the code, etc.).
-  - `"inconclusive"` — the file's behaviour genuinely depends on
-                       context outside the file itself (downstream
-                       caller invariants, pinned dependency
-                       internals you cannot read). Prefer a
-                       definite verdict when you can.
+  - `"inconclusive"` — the determination genuinely depends on
+                       context outside the *worktree* (off-tree
+                       dependency internals, runtime configuration
+                       not present in the tree). If it instead
+                       depends on another file in the worktree — a
+                       caller, a route definition, infrastructure-
+                       as-code — read that file before deciding;
+                       needing a second file is NOT a reason for
+                       inconclusive. Prefer a definite verdict when
+                       you can.
+
+Exploitability includes reachability. Before confirming, check whether
+the assumed attacker can actually reach this code: consult the
+worktree's infrastructure-as-code, ingress, and network-bind
+configuration to confirm or refute exposure (internet-facing vs
+internal-only vs gated by an upstream auth layer). Let that inform both
+the verdict and any severity caveat in `notes`.
 
 Your verdict is locked the moment you call `submit_verdict`. Think
 hard before calling.
@@ -335,6 +364,45 @@ mod tests {
 			collapsed.contains("only a small fraction")
 				&& collapsed.contains("high or critical severity"),
 			"discovery prompt must discourage inflated high/critical severity ratings",
+		);
+	}
+
+	#[test]
+	fn discovery_prompt_directs_reachability_tracing() {
+		// Exploitability of unauth/exposed-endpoint bugs hinges on
+		// whether the deployment actually exposes them. Pin that the
+		// prompt tells the agent to trace reachability across the
+		// whole worktree (incl. IaC), not just the anchor file.
+		let collapsed: String = DISCOVERY.split_whitespace().collect::<Vec<_>>().join(" ");
+		assert!(
+			collapsed.contains("whole worktree is readable"),
+			"discovery prompt must remind the agent the whole worktree is readable",
+		);
+		assert!(
+			collapsed.contains("trace that reachability across the tree")
+				&& collapsed.contains("infrastructure"),
+			"discovery prompt must direct reachability tracing through infrastructure/deploy code",
+		);
+	}
+
+	#[test]
+	fn verify_inconclusive_is_scoped_to_the_worktree_not_the_file() {
+		// The load-bearing fix: inconclusive is for context outside
+		// the *worktree*, not merely outside the file. Needing a
+		// second in-tree file (caller, route, IaC) must NOT trigger
+		// inconclusive — the agent should open it.
+		let collapsed: String = VERIFY.split_whitespace().collect::<Vec<_>>().join(" ");
+		assert!(
+			collapsed.contains("context outside the *worktree*"),
+			"verify prompt must scope inconclusive to the worktree, not the file",
+		);
+		assert!(
+			collapsed.contains("read that file before deciding"),
+			"verify prompt must tell the agent to read other in-tree files before going inconclusive",
+		);
+		assert!(
+			collapsed.contains("Exploitability includes reachability"),
+			"verify prompt must fold reachability into the exploitability check",
 		);
 	}
 
