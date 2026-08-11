@@ -40,6 +40,37 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
 
+        # Run a toolchain binary with the credential dirs masked, so a
+        # malicious build.rs / proc-macro from a pulled crate can't read
+        # them. Denylist sandbox: the whole fs stays visible except the
+        # tmpfs'd secret dirs, so cargo still fetches,
+        # builds, and writes target/ normally. Only dirs that exist are
+        # masked, since bwrap errors on a missing --tmpfs target. The
+        # toolchain goes first on PATH inside the sandbox so a nested cargo
+        # resolves the real binary instead of re-entering this wrapper.
+        sandboxSecrets = name: real:
+          pkgs.writeShellScriptBin name ''
+            # The wrapped tool runs untrusted crate build scripts, so drop the
+            # secrets it never needs; masking the age-key file is moot if the
+            # already-decrypted values sit in the inherited env. CARGO_REGISTRY_TOKEN
+            # is the classic supply-chain target and a build never needs it.
+            unset LOUPE_CLONE_PAT LOUPE_DEPLOY_HOST CARGO_REGISTRY_TOKEN
+            args=()
+            for d in "$HOME/.config/sops" "$HOME/.ssh" "$HOME/.gnupg" \
+                     "$HOME/.aws" "$HOME/.config/gh" "$HOME/.config/gcloud"; do
+              [ -e "$d" ] && args+=(--tmpfs "$d")
+            done
+            exec ${pkgs.bubblewrap}/bin/bwrap --dev-bind / / \
+              --setenv PATH "${toolchain}/bin:$PATH" \
+              "''${args[@]}" ${real} "$@"
+          '';
+        sandboxedCargo = sandboxSecrets "cargo" "${toolchain}/bin/cargo";
+        # rust-analyzer runs the same build.rs / proc-macros from the editor,
+        # so it needs the same masking. VS Code must be told to use this via
+        # rust-analyzer.server.path (see .vscode/settings.json); editors that
+        # resolve rust-analyzer from PATH pick up the shim for free.
+        sandboxedRustAnalyzer = sandboxSecrets "rust-analyzer" "${pkgs.rust-analyzer}/bin/rust-analyzer";
+
         # Keep loupe-web's assets (index.html / app.css / app.js) that its
         # `include_str!` needs; cleanCargoSource would otherwise strip them.
         src = pkgs.lib.cleanSourceWith {
@@ -163,6 +194,10 @@
                 ln -sf "$(readlink -f "$(command -v "$tool-unsandboxed")")" "$shims/$tool"
               fi
             done
+            # Shadow cargo and rust-analyzer with the credential-masking
+            # sandbox wrapper (both execute crate build scripts).
+            ln -sf ${sandboxedCargo}/bin/cargo "$shims/cargo"
+            ln -sf ${sandboxedRustAnalyzer}/bin/rust-analyzer "$shims/rust-analyzer"
             export PATH="$shims:$PATH"
 
             # Load developer-local secrets (deploy host, clone PAT) from the

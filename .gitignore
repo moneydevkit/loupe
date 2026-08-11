@@ -26,7 +26,10 @@ Cargo.lock.bak
 
 # Editor / OS
 .idea/
-.vscode/
+# Share the sandboxed rust-analyzer wiring; keep personal editor state out.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 *.swp
 *.swo
 .DS_Store

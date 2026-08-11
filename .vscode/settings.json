@@ -1,0 +1,7 @@
+{
+  // Use the devShell's sandboxed rust-analyzer shim (see flake.nix) instead
+  // of the extension's bundled binary, so proc-macro / build.rs execution
+  // is masked from the credential dirs. Requires the direnv extension so the
+  // shim and toolchain are present; open the folder from the devShell.
+  "rust-analyzer.server.path": "${workspaceFolder}/.direnv/agent-shims/rust-analyzer"
+}
