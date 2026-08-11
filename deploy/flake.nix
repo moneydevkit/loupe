@@ -1,4 +1,4 @@
-# Deployment flake for a loupe box running Determinate NixOS.
+# Deployment flake for a loupe box, built on stock NixOS.
 #
 # Real box:  nixos-rebuild switch --flake ./deploy#loupe --target-host root@<box>
 # VM smoke:  nix build ./deploy && ./result/bin/run-loupe-vm
@@ -7,15 +7,24 @@
 # (./deploy), the fetcher copies tracked files only, so target/ and other
 # untracked state never reach the store. Everything the deployment needs
 # must therefore be git-tracked.
+#
+# We deliberately do NOT use Determinate Nix here: its determinate-nix-expr
+# (wasmtime) source-builds and OOMs a small box, and its wins (lazy trees,
+# the macOS Linux builder, FlakeHub) are developer-workstation features that
+# do nothing on a headless scanner. Stock nixpkgs substitutes everything from
+# cache.nixos.org, so the install is hands-off on an 8G box.
 {
   description = "loupe deployment";
 
   inputs = {
     loupe.url = "path:..";
     nixpkgs.follows = "loupe/nixpkgs";
-    determinate.url = "https://flakehub.com/f/DeterminateSystems/determinate/*";
     sops-nix = {
       url = "github:Mic92/sops-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    disko = {
+      url = "github:nix-community/disko";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -25,8 +34,8 @@
       self,
       nixpkgs,
       loupe,
-      determinate,
       sops-nix,
+      disko,
       ...
     }:
     {
@@ -35,10 +44,11 @@
         specialArgs = { inherit loupe; };
         modules = [
           loupe.nixosModules.loupe
-          determinate.nixosModules.default
           sops-nix.nixosModules.sops
+          disko.nixosModules.disko
           ./configuration.nix
           ./hardware-configuration.nix
+          ./disko.nix
         ];
       };
 
