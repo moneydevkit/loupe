@@ -147,6 +147,8 @@
             sops
             # Deploy / local-VM operations; see ./justfile.
             just
+            # Installs the deploy flake onto a fresh box; see deploy/README.md.
+            nixos-anywhere
           ];
 
           # loupe's bwrap sandbox can't nest the isolate-wrapped agent
