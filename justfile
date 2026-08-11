@@ -16,8 +16,8 @@ vm_port := "2223"
 ssh := "ssh -i " + home_directory() + "/.ssh/id_ed25519 -p " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@localhost"
 scp := "scp -i " + home_directory() + "/.ssh/id_ed25519 -P " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
-# Deployed droplet host for the `dashboard` recipe. Not hardcoded here; set
-# it in your (gitignored) .envrc: `export LOUPE_DEPLOY_HOST=<ip-or-hostname>`.
+# Deployed droplet host for the `dashboard` recipe. Not hardcoded here; the
+# devShell decrypts it from secrets.yaml into LOUPE_DEPLOY_HOST (see flake.nix).
 droplet_host := env_var_or_default("LOUPE_DEPLOY_HOST", "")
 
 default:

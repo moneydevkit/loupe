@@ -164,6 +164,19 @@
               fi
             done
             export PATH="$shims:$PATH"
+
+            # Load developer-local secrets (deploy host, clone PAT) from the
+            # sops-encrypted secrets.yaml into the env for the just recipes.
+            # Best-effort: a missing file or age key is a silent no-op, so the
+            # shell still works for contributors without the operator key.
+            if [ -f "$PWD/secrets.yaml" ] && command -v sops > /dev/null 2>&1; then
+              if host=$(sops -d --extract '["deploy-host"]' "$PWD/secrets.yaml" 2>/dev/null); then
+                export LOUPE_DEPLOY_HOST="$host"
+              fi
+              if pat=$(sops -d --extract '["clone-pat"]' "$PWD/secrets.yaml" 2>/dev/null); then
+                export LOUPE_CLONE_PAT="$pat"
+              fi
+            fi
           '';
         };
       }

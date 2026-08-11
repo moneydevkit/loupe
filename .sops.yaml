@@ -1,0 +1,24 @@
+# sops config for the repo-root secrets.yaml: developer-local values the
+# devShell loads into the environment (see flake.nix shellHook). These never
+# reach the deployed box, so only the operator key is a recipient. Box
+# secrets live in deploy/secrets.yaml under deploy/.sops.yaml instead.
+#
+# Editing:
+#   nix develop -c sops secrets.yaml
+# opens $EDITOR on the decrypted file; saving re-encrypts. Never pass secret
+# values on the command line; they end up in shell history.
+#
+# Contents:
+#   deploy-host  The droplet's address, consumed as LOUPE_DEPLOY_HOST by the
+#                `just dashboard` / repo recipes. Encrypted so it stays out
+#                of the repo in plaintext.
+#   clone-pat    GitHub PAT with read Contents scope on the private
+#                CumuloGlobal repos, consumed as LOUPE_CLONE_PAT by
+#                `loupectl repo add --clone-pat` at registration.
+keys:
+  - &operator age1vjhlz2h8j5wm8jjfjtg785rzg02yxaj8fx565d67m565qw8uygusadh7nh
+creation_rules:
+  - path_regex: secrets\.yaml$
+    key_groups:
+      - age:
+          - *operator
