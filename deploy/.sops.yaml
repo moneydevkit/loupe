@@ -22,9 +22,12 @@ keys:
   - &operator age1vjhlz2h8j5wm8jjfjtg785rzg02yxaj8fx565d67m565qw8uygusadh7nh
   # Local VM (ssh_host_ed25519_key of the loupe.qcow2 image)
   - &loupe-vm age1yzy89s2w7ns80xkr9sgtank0e27d37lrvk5vx8ck9sccja0ckpdsasy6e9
+  # DigitalOcean box (ssh_host_ed25519_key of the droplet)
+  - &loupe-do age105ez8g35zt5en5n37cy0dzug77dwjwcxnal6jlcve30psdnh8euq82hyew
 creation_rules:
   - path_regex: secrets\.yaml$
     key_groups:
       - age:
           - *operator
           - *loupe-vm
+          - *loupe-do
