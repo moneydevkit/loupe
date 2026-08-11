@@ -1,20 +1,41 @@
 # Deploying loupe on NixOS
 
-This sub-flake turns a box running Determinate NixOS into a loupe host
-(server + worker, kimi scanning and codex verification via OpenRouter).
+This sub-flake turns a fresh box into a NixOS loupe host (server +
+worker, kimi scanning and codex verification via OpenRouter).
 Everything is built from the parent checkout, so deploying from a
 branch needs no package pins or hash bumps. Only git-tracked files
 reach the build; `git add -N` new files before deploying.
 
 ## First deploy of a new box
 
-Install NixOS with the Determinate installer and get root SSH access.
-Then, from this directory:
+Create a KVM box with root SSH; any stock Linux image works, since the
+installer replaces it. On DigitalOcean, an Ubuntu 24.04 droplet (4 GB+
+RAM) is fine. `disko.nix` and `hardware-configuration.nix` are preset
+for a DO virtio guest booting BIOS (legacy) via GRUB; for a UEFI box or
+other hardware, adjust them per the notes in those files. From this
+directory:
 
-1. Admit the box to the secrets file. On the box:
+1. Install NixOS onto the box (run from the repo root, where the
+   devshell provides `nixos-anywhere`). It kexecs into an in-RAM
+   installer, partitions the disk per `disko.nix`, and installs the
+   flake's system. `--build-on remote` builds on the box instead of
+   uploading a closure over a slow uplink; stock nixpkgs substitutes
+   everything from `cache.nixos.org`, so little compiles:
 
    ```
-   nix run nixpkgs#ssh-to-age < /etc/ssh/ssh_host_ed25519_key.pub
+   nix develop -c nixos-anywhere \
+     --flake ./deploy#loupe --build-on remote \
+     root@<box>
+   ```
+
+   This wipes the disk. The box reboots into NixOS, where the loupe
+   units crash-loop: sops can't decrypt yet, because the box's freshly
+   generated host key isn't a recipient of `secrets.yaml`.
+
+2. Admit the box to the secrets file. Read its host key:
+
+   ```
+   ssh root@<box> cat /etc/ssh/ssh_host_ed25519_key.pub | nix run nixpkgs#ssh-to-age
    ```
 
    Add the resulting `age1...` key to `.sops.yaml`, then:
@@ -23,24 +44,18 @@ Then, from this directory:
    sops updatekeys secrets.yaml
    ```
 
-2. Set the service's OpenRouter key (a dedicated one, not personal;
+3. Set the service's OpenRouter key (a dedicated one, not personal;
    see `.sops.yaml` for editing rules):
 
    ```
    nix develop -c sops deploy/secrets.yaml    # from the repo root
    ```
 
-3. Replace `hardware-configuration.nix` with the box's own
-   `nixos-generate-config` output, and put your SSH public key in
-   `configuration.nix` (the FIXME).
-
-4. Deploy:
+4. Deploy, now that the host key and OpenRouter key are in place:
 
    ```
    nixos-rebuild switch --flake ./deploy#loupe --target-host root@<box>
    ```
-
-   The loupe units crash-loop at this point; they have no certs yet.
 
 5. Bootstrap once, on the box:
 
