@@ -5,9 +5,10 @@
 #   1. Add the box to .sops.yaml (ssh-to-age < its ssh_host_ed25519_key.pub)
 #      and run `sops updatekeys secrets.yaml`.
 #   2. Set the service's dedicated OpenRouter key: see .sops.yaml.
-#   3. Replace hardware-configuration.nix with the box's own.
-# After the first switch, run `sudo loupe-bootstrap` on the box to mint
-# certs and register the worker.
+# disko.nix + hardware-configuration.nix are preset for a DO KVM (virtio)
+# droplet; adjust only for other hardware or a BIOS box. After the first
+# switch, run `sudo loupe-bootstrap` on the box to mint certs and register
+# the worker.
 {
   config,
   pkgs,
@@ -45,10 +46,72 @@ in
   networking.hostName = "loupe";
   system.stateVersion = "26.05";
 
+  # DigitalOcean provisions networking through its config-2 drive
+  # (OpenStack ConfigDrive), not plain DHCP. cloud-init reads it at boot
+  # and brings the interface up; without this the box has no network and
+  # is unreachable after install.
+  services.cloud-init = {
+    enable = true;
+    network.enable = true;
+    settings.datasource_list = [ "ConfigDrive" ];
+  };
+
+  # cloud-init configures the interface through networkd; make networkd
+  # the sole manager so it doesn't race dhcpcd (scripted DHCP), which the
+  # evaluator warns can drop networking entirely.
+  networking.useNetworkd = true;
+  networking.useDHCP = false;
+
+  # resolv.conf must be a DIRECT symlink to a /nix/store file. The scanner
+  # sandbox ro-binds all of /etc and /nix/store, so a store-file resolv.conf
+  # is already readable inside it — but the sandbox's add_resolver_binds
+  # also tries to bind onto the symlink's immediate target, and both the
+  # systemd-resolved chain (-> /run/...) and the NixOS `environment.etc`
+  # chain (-> /etc/static/... , itself a symlink into the read-only store)
+  # give bwrap a target it can't create a mountpoint at, killing every
+  # session. A direct `/etc/resolv.conf -> /nix/store/...` makes that target
+  # the store path itself, which is already bound, so the bind is a no-op
+  # and DNS works. resolved + resolvconf off so nothing else manages it.
+  services.resolved.enable = false;
+  networking.resolvconf.enable = false;
+  systemd.tmpfiles.rules = [
+    "L+ /etc/resolv.conf - - - - ${pkgs.writeText "loupe-resolv.conf" ''
+      nameserver 1.1.1.1
+      nameserver 8.8.8.8
+      options edns0
+    ''}"
+  ];
+
+  # DO's CPU/memory/disk graphs come from this in-guest agent (bandwidth
+  # is measured at the hypervisor, so it works without it). It reports to
+  # DO's metrics endpoint.
+  services.do-agent.enable = true;
+
+  # Basic hardening. The only public service is SSH: the loupe server
+  # binds 127.0.0.1 (loopback, exempt from the firewall) and the worker
+  # only makes outbound connections. Deliberately NOT touched:
+  # unprivileged user namespaces and kernel tunables, which the scanner's
+  # bwrap sandbox needs (see LOUPE.md) — hardening those breaks scanning.
   services.openssh.enable = true;
+  services.openssh.settings = {
+    PasswordAuthentication = false;
+    KbdInteractiveAuthentication = false;
+    # Deploy drives root over SSH (nixos-rebuild --target-host, bootstrap),
+    # so keep root but key-only.
+    PermitRootLogin = "prohibit-password";
+  };
   users.users.root.openssh.authorizedKeys.keys = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKj473/+eAlgy1rQwuO+nCRrqhiPAWEgYPIn5j/NdN1Q"
   ];
+
+  # Drop everything inbound except SSH; nothing else should be reachable.
+  networking.firewall = {
+    enable = true;
+    allowedTCPPorts = [ 22 ];
+  };
+  # Ban IPs that hammer SSH. Marginal with key-only auth, but it trims the
+  # constant bot noise from a public box.
+  services.fail2ban.enable = true;
 
   sops.defaultSopsFile = ./secrets.yaml;
   sops.age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
@@ -171,4 +234,10 @@ in
       }
     ];
   };
+
+  # do-agent has no metrics endpoint on a local VM, and its node exporter
+  # crash-loops on the VM's doubled /nix/store overlay mount (the same
+  # filesystem is collected twice with identical labels, which trips the
+  # duplicate-series guard), spinning the CPU. Only the real droplet wants it.
+  virtualisation.vmVariant.services.do-agent.enable = false;
 }
