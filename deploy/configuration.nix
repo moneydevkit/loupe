@@ -205,6 +205,58 @@ in
   # module's own worker PATH (git + bubblewrap + agent CLIs).
   systemd.services.loupe-worker.path = [ loupePkgs.bkb-mcp ];
 
+  # Operator dashboard (loupe-web): a loopback-only daemon that holds the
+  # admin cert and proxies to loupe-server, so the browser needs no client
+  # cert. View it over an SSH tunnel to 8455. It prints an access-token URL
+  # (`#t=<token>`) to stdout at startup, which lands in the journal here, so
+  # read the current URL from `journalctl -u loupe-web`. A fresh token is
+  # minted on every start. The admin bundle only exists after
+  # loupe-bootstrap has stashed it in /root/loupe-admin, so this crash-loops
+  # until then (systemd reads the credential sources as root, then hands
+  # them to the DynamicUser via $CREDENTIALS_DIRECTORY).
+  systemd.services.loupe-web = {
+    description = "loupe operator dashboard";
+    wantedBy = [ "multi-user.target" ];
+    after = [
+      "network-online.target"
+      "loupe-server.service"
+    ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      ExecStart = "${config.services.loupe.package}/bin/loupe-web";
+      DynamicUser = true;
+      LoadCredential = [
+        "ca.pem:/root/loupe-admin/ca.pem"
+        "admin.pem:/root/loupe-admin/admin.pem"
+        "admin.key:/root/loupe-admin/admin.key"
+      ];
+      Environment = [
+        "LOUPE_SERVER_URL=https://127.0.0.1:8443"
+        "LOUPE_CA_CERT=%d/ca.pem"
+        "LOUPE_ADMIN_CERT=%d/admin.pem"
+        "LOUPE_ADMIN_KEY=%d/admin.key"
+        "LOUPE_WEB_BIND=127.0.0.1:8455"
+      ];
+      Restart = "on-failure";
+      RestartSec = 5;
+      # Loopback HTTP proxy, no sandbox nesting, so lock it down. AF_UNIX is
+      # kept for the journal stdout socket that carries the token line.
+      NoNewPrivileges = true;
+      PrivateTmp = true;
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      RestrictAddressFamilies = [
+        "AF_UNIX"
+        "AF_INET"
+        "AF_INET6"
+      ];
+      RestrictNamespaces = true;
+    };
+  };
+
   # `nix build ./deploy` local VM: the same system, deployable on any
   # machine with KVM. Root disk (./loupe.qcow2) persists across runs, so
   # state survives like a physical box; the host /nix/store is mounted

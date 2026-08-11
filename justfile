@@ -16,6 +16,10 @@ vm_port := "2223"
 ssh := "ssh -i " + home_directory() + "/.ssh/id_ed25519 -p " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@localhost"
 scp := "scp -i " + home_directory() + "/.ssh/id_ed25519 -P " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
+# Deployed droplet host for the `dashboard` recipe. Not hardcoded here; set
+# it in your (gitignored) .envrc: `export LOUPE_DEPLOY_HOST=<ip-or-hostname>`.
+droplet_host := env_var_or_default("LOUPE_DEPLOY_HOST", "")
+
 default:
     @just --list
 
@@ -100,3 +104,37 @@ report id="1":
     {{ssh}} loupe-report {{id}} -o /tmp/loupe-findings.html
     {{scp}} root@localhost:/tmp/loupe-findings.html ./loupe-findings.html
     @echo "wrote ./loupe-findings.html (open with: xdg-open loupe-findings.html)"
+
+# Forward <host>:8455 (loupe-web's loopback) to localhost and open the current
+# token URL in a browser. A fresh token is minted each start and printed to the
+# journal; this reads the latest. Ctrl-C closes the tunnel. Shared worker; call
+# `dashboard` / `dashboard-local`, not this.
+_dashboard host port:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host="{{host}}"
+    if [ -z "$host" ]; then
+        echo "no host — export LOUPE_DEPLOY_HOST for the dashboard recipe" >&2
+        exit 1
+    fi
+    opts=(-i {{home_directory()}}/.ssh/id_ed25519 -p {{port}} -F /dev/null
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+    url=$(ssh "${opts[@]}" "root@$host" 'journalctl -u loupe-web --no-pager --output cat 2>/dev/null | grep -oE "http://127\.0\.0\.1:8455/#t=[A-Za-z0-9_-]+" | tail -1')
+    if [ -z "$url" ]; then
+        echo "no token URL in the loupe-web journal on $host — is the unit running?" >&2
+        exit 1
+    fi
+    echo "forwarding $host:8455 -> localhost:8455 (Ctrl-C to close)"
+    ssh "${opts[@]}" -L 8455:127.0.0.1:8455 -N "root@$host" &
+    tunnel=$!
+    trap 'kill $tunnel 2>/dev/null || true' EXIT
+    sleep 2
+    echo "opening $url"
+    xdg-open "$url" >/dev/null 2>&1 || echo "open it manually: $url"
+    wait $tunnel
+
+# Open the loupe-web operator dashboard on the local VM.
+dashboard-local: (_dashboard "localhost" vm_port)
+
+# Open the loupe-web operator dashboard on the deployed droplet (LOUPE_DEPLOY_HOST).
+dashboard: (_dashboard droplet_host "22")
