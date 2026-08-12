@@ -16,12 +16,40 @@ vm_port := "2223"
 ssh := "ssh -i " + home_directory() + "/.ssh/id_ed25519 -p " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@localhost"
 scp := "scp -i " + home_directory() + "/.ssh/id_ed25519 -P " + vm_port + " -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
-# Deployed droplet host for the `dashboard` recipe. Not hardcoded here; the
-# devShell decrypts it from secrets.yaml into LOUPE_DEPLOY_HOST (see flake.nix).
+# Deployed droplet host for the `deploy` / `dashboard` recipes. Not hardcoded
+# here; the devShell decrypts it from secrets.yaml into LOUPE_DEPLOY_HOST
+# (see flake.nix).
 droplet_host := env_var_or_default("LOUPE_DEPLOY_HOST", "")
+
+# Host-key flags for nixos-rebuild's SSH to the droplet. Relaxed like the VM
+# ssh var; pin the droplet host key before wiring deploys into CI.
+nix_sshopts := "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
 default:
     @just --list
+
+# Reuses any build already realized (e.g. by `deploy-check`). Restarts
+# loupe-server/web/worker; a scan in progress is interrupted then re-leased by
+# the reaper (re-run, not lost -- see CLAUDE.md). Run `deploy-check` first.
+# Build and switch the droplet to the current working tree.
+deploy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host="{{droplet_host}}"
+    [ -n "$host" ] || { echo "no host -- export LOUPE_DEPLOY_HOST" >&2; exit 1; }
+    NIX_SSHOPTS="{{nix_sshopts}}" \
+        nixos-rebuild switch --flake ./deploy#loupe --target-host "root@$host"
+
+# Builds and copies the closure but does not activate; use before `deploy` to
+# see whether a running scan's unit would be restarted.
+# Dry-run the deploy and print which units would restart.
+deploy-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host="{{droplet_host}}"
+    [ -n "$host" ] || { echo "no host -- export LOUPE_DEPLOY_HOST" >&2; exit 1; }
+    NIX_SSHOPTS="{{nix_sshopts}}" \
+        nixos-rebuild dry-activate --flake ./deploy#loupe --target-host "root@$host"
 
 # Build the VM image from the current working tree.
 vm-build:
