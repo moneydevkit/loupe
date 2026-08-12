@@ -56,6 +56,16 @@ in
     settings.datasource_list = [ "ConfigDrive" ];
   };
 
+  # DO's config-2 drive ships Ubuntu vendor/per-instance scripts
+  # (install-do-agent, VPC peering, machine-id) cached at first boot and
+  # re-run on every activation. They assume apt and a writable /etc, so on
+  # NixOS they fail and cloud-init reports status=error (exit 2). None of it
+  # is load-bearing here (the agent and networking are declarative), so treat
+  # exit 2 as success rather than failing every `nixos-rebuild switch`. The
+  # scripts still run and fail each boot; suppressing them is a separate
+  # cloud-init module question.
+  systemd.services.cloud-final.serviceConfig.SuccessExitStatus = [ 2 ];
+
   # cloud-init configures the interface through networkd; make networkd
   # the sole manager so it doesn't race dhcpcd (scripted DHCP), which the
   # evaluator warns can drop networking entirely.
