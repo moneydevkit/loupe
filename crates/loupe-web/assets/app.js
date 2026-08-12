@@ -16,6 +16,11 @@ let CONFIG = {
 let CAPABILITY_TOKEN = null;
 let REPOS = [];
 let FINDINGS = [];
+// Guards the shared FINDINGS against stale async writes: every load/search
+// bumps the generation and records which repo it rendered, so a late
+// response for a repo the user already navigated away from is dropped.
+let FINDINGS_GEN = 0;
+let FINDINGS_REPO = null;
 let CURRENT_VIEW = "repos";
 let POLL_TIMER = null;
 let POLL_GENERATION = 0;
@@ -719,14 +724,28 @@ function applyFindingFilters() {
 }
 
 async function loadFindings() {
+  const gen = ++FINDINGS_GEN;
   const repoId = $("findings-repo").value;
   if (!repoId) {
+    FINDINGS = [];
+    FINDINGS_REPO = null;
     clear($("findings-list"));
     $("findings-scope").textContent = "Register a repository first.";
     return;
   }
+  // On a repo switch, drop the old list immediately so a slow fetch can't
+  // leave the previous repo's findings on screen under the new selection.
+  if (repoId !== FINDINGS_REPO) {
+    FINDINGS = [];
+    clear($("findings-list"));
+  }
   const limit = Number($("findings-limit").value) || 200;
   const body = await api("GET", "/api/repos/" + repoId + "/findings?limit=" + limit);
+  // A background poll or an earlier repo's request can resolve after the
+  // selection moved on; a newer call bumped the generation, so drop this
+  // response rather than render it against the wrong repo.
+  if (gen !== FINDINGS_GEN) return;
+  FINDINGS_REPO = repoId;
   FINDINGS = body.findings || [];
   const shown = applyFindingFilters();
   // State and severity filtering is client-side because the server has no
@@ -737,6 +756,7 @@ async function loadFindings() {
 }
 
 async function searchFindings(term) {
+  const gen = ++FINDINGS_GEN;
   const repoId = $("findings-repo").value;
   if (!repoId) throw new Error("pick a repository first");
 
@@ -755,6 +775,10 @@ async function searchFindings(term) {
     "GET",
     "/api/repos/" + repoId + "/findings/search?limit=100&q=" + encodeURIComponent(term)
   );
+  // Drop the response if the selection moved on while the search was in
+  // flight (same guard as loadFindings).
+  if (gen !== FINDINGS_GEN) return;
+  FINDINGS_REPO = repoId;
   FINDINGS = body.findings || [];
   const shown = applyFindingFilters();
   $("findings-scope").textContent =
