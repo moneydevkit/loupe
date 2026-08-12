@@ -101,7 +101,8 @@ in
     PermitRootLogin = "prohibit-password";
   };
   users.users.root.openssh.authorizedKeys.keys = [
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKj473/+eAlgy1rQwuO+nCRrqhiPAWEgYPIn5j/NdN1Q"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKj473/+eAlgy1rQwuO+nCRrqhiPAWEgYPIn5j/NdN1Q amackillop"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAQhNorK/ESn2SY34N/eRt1QHVqPuFi8kn3g5E8FLmtC martinsaposnic"
   ];
 
   # Drop everything inbound except SSH; nothing else should be reachable.
